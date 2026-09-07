@@ -42,7 +42,7 @@
 #include <linux/ktime.h>
 #include <linux/stdarg.h>
 
-#define DHT_DRIVER_VERSION  "2.1"
+#define DHT_DRIVER_VERSION  "2.2"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DHT Driver");
@@ -59,6 +59,7 @@ MODULE_VERSION(DHT_DRIVER_VERSION);
 #define MAX_PIN_NUM      27
 #define MIN_INTERVAL     2
 #define MAX_INTERVAL     60
+#define MEAS_MIN_GAP     2   /* minimum seconds between manual measurements */
 
 /* ── Error codes ─────────────────────────────────────────────────── */
 #define ERR_SUCCESS       0
@@ -66,6 +67,7 @@ MODULE_VERSION(DHT_DRIVER_VERSION);
 #define ERR_GPIO_REQUEST  2
 #define ERR_READ_FAILED   3
 #define ERR_AUTO_MODE     4
+#define ERR_TOO_SOON      5
 
 /* ── Sensor types ────────────────────────────────────────────────── */
 #define SENSOR_TYPE_UNKNOWN  0
@@ -198,6 +200,7 @@ struct dht_sensor {
     int sensor_type;
     time64_t register_time;
     time64_t last_meas_time;
+    time64_t last_attempt_time;
     char info_text[INFO_BUF_LEN];
     bool info_filled;
 
@@ -225,6 +228,7 @@ static const char *error_str(int code)
     case ERR_GPIO_REQUEST:  return "GPIO request/lookup failed";
     case ERR_READ_FAILED:   return "Sensor data read failed";
     case ERR_AUTO_MODE:     return "Manual measure disabled in auto mode";
+    case ERR_TOO_SOON:      return "Too soon since last measurement (min 2s)";
     default:                return "Unknown error";
     }
 }
@@ -367,9 +371,6 @@ static int dht_read_sensor(int pin, int *hum, int *temp, int *type)
         int h = ((data[0] << 8) + data[1]);
         int c = (((data[2] & 0x7F) << 8) + data[3]);
 
-        /* Detect sensor type:
-         * DHT11: data[1] and data[3] are always 0, so h > 1000
-         * DHT22: decimal bytes are used, so h <= 1000 */
         if (h > 1000) {
             if (type) *type = SENSOR_TYPE_DHT11;
             h = data[0] * 10;
@@ -392,10 +393,13 @@ static int dht_read_sensor(int pin, int *hum, int *temp, int *type)
 }
 
 /* ── Perform a measurement (assumes sensor->lock held) ────────────── */
-static void dht_do_measurement(struct dht_sensor *sensor)
+/* manual=true  → rate limit applies (ERR_TOO_SOON if < 2s since last) */
+/* manual=false → no rate limit (auto-poll, first measurement)        */
+static void dht_do_measurement(struct dht_sensor *sensor, bool manual)
 {
     int hum = 0, temp = 0, type = 0;
     int ret;
+    time64_t now;
 
     if (sensor->pin < 0 || sensor->pin > MAX_PIN_NUM) {
         sensor->status_code = ERR_PIN_INVALID;
@@ -403,6 +407,24 @@ static void dht_do_measurement(struct dht_sensor *sensor)
                  error_str(ERR_PIN_INVALID));
         return;
     }
+
+    /* Rate limit: only for manual measurements */
+    if (manual) {
+        now = ktime_get_real_seconds();
+        if (sensor->last_attempt_time > 0 &&
+            (now - sensor->last_attempt_time) < MEAS_MIN_GAP) {
+            sensor->status_code = ERR_TOO_SOON;
+            snprintf(sensor->status_text, STATUS_BUF_LEN, "%s",
+                     error_str(ERR_TOO_SOON));
+            pin_dbg(sensor->pin,
+                    "manual measurement rejected — only %llds since last attempt\n",
+                    (long long)(now - sensor->last_attempt_time));
+            return;
+        }
+    }
+
+    /* Record attempt time for all measurement types */
+    sensor->last_attempt_time = ktime_get_real_seconds();
 
     ret = dht_read_sensor(sensor->pin, &hum, &temp, &type);
     sensor->status_code = ret;
@@ -412,7 +434,7 @@ static void dht_do_measurement(struct dht_sensor *sensor)
         sensor->humidity_raw = hum;
         sensor->temperature_raw = temp;
         sensor->sensor_type = type;
-        sensor->last_meas_time = ktime_get_real_seconds();
+        sensor->last_meas_time = sensor->last_attempt_time;
         pin_dbg(sensor->pin, "measurement OK — H=%d.%d%% T=%d.%d C\n",
                 hum / 10, hum % 10, temp / 10, temp % 10);
     }
@@ -433,7 +455,7 @@ static int dht_poll_thread_fn(void *data)
     while (!kthread_should_stop()) {
         mutex_lock(&sensor->lock);
         interval = sensor->interval;
-        dht_do_measurement(sensor);
+        dht_do_measurement(sensor, false);
         mutex_unlock(&sensor->lock);
 
         {
@@ -650,7 +672,7 @@ static ssize_t sensor_measure_write(struct file *f, const char __user *buf,
         pin_dbg(sensor->pin, "manual measure ignored (auto mode)\n");
     } else {
         pin_dbg(sensor->pin, "manual measure triggered\n");
-        dht_do_measurement(sensor);
+        dht_do_measurement(sensor, true);
     }
 
     mutex_unlock(&sensor->lock);
@@ -907,6 +929,7 @@ static ssize_t export_write(struct file *f, const char __user *buf,
     sensor->register_time = ktime_get_real_seconds();
     sensor->sensor_type = SENSOR_TYPE_UNKNOWN;
     sensor->info_filled = false;
+    sensor->last_attempt_time = 0;
     snprintf(sensor->status_text, STATUS_BUF_LEN, "No measurement taken");
     mutex_init(&sensor->lock);
 
@@ -917,11 +940,9 @@ static ssize_t export_write(struct file *f, const char __user *buf,
         return ret;
     }
 
-    /* Perform first measurement — sensor is not yet in the list,
-     * so unexport cannot race with us. list_lock is held to prevent
-     * other export/unexport calls. */
+    /* Perform first measurement — not manual, so no rate limit */
     mutex_lock(&sensor->lock);
-    dht_do_measurement(sensor);
+    dht_do_measurement(sensor, false);
 
     if (sensor->status_code == ERR_SUCCESS) {
         dht_fill_info(sensor);
