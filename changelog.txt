@@ -1,0 +1,59 @@
+DHT Driver — Changelog
+======================
+
+Version 2.5 (from 2.4)
+----------------------
+
+1. Nanosecond-precision pulse timing
+   - Replaced counter + udelay(1) approach with ktime_get_ns() for
+     accurate pulse-width measurement.
+   - New constants: BIT_THRESHOLD (40 us), PULSE_TIMEOUT_NS (200 us).
+   - Fixes unreliable reads on Pi 3/4 where udelay-based counter
+     threshold (counter > 16) was CPU-speed dependent.
+
+2. Read retry mechanism
+   - Added MAX_RETRIES (3) with RETRY_DELAY_MS (100 ms) delay between
+     attempts. DHT11 often fails on first read after module load.
+
+3. Increased MAX_TIMINGS from 85 to 100
+   - 85 was barely enough for 84 pulse transitions; glitches could
+     cause loss of the last bit (j=39 instead of 40).
+
+4. GPIO chip base caching (cached_chip_base)
+   - First registration detects the Pi GPIO chip base and caches it.
+   - Subsequent registrations use fast path: gpio_to_desc(base + pin)
+     instead of scanning 0..2048 every time.
+   - dht_find_desc is now silent — chip detection logged once at
+     registration in export_write, not repeated per measurement.
+
+5. Unified measurement path
+   - Poll thread now calls dht_do_measurement(sensor, false) instead
+     of dht_read_sensor directly.
+   - All measurement paths (registration, manual, poll) share the
+     same logic and logging.
+
+6. Locking redesign in dht_do_measurement
+   - Acquires sensor->lock only for rate-limit check and result
+     storage; releases during the 20+ ms GPIO read.
+   - Eliminates deadlock risk and reduces lock contention.
+
+7. Always-on registration/unregistration logging
+   - unexport_write now uses pin_log (always printed) instead of
+     pin_dbg (debug-only) for the "unregistered" message.
+
+8. Driver metadata and startup message
+   - MODULE_AUTHOR set to "DHT Driver (c) 2026, Chapvic".
+   - License updated to GPL v3.
+   - Module init prints two-line banner: copyright + version/load info.
+
+9. Start signal duration
+   - Increased from 18 ms to 20 ms for better sensor response margin.
+
+10. Comprehensive code documentation
+   - Added detailed function-level comments (purpose, parameters,
+     return values) and inline logic comments throughout the driver.
+   - All comments in English.
+
+11. Cleanup
+   - Removed unused #include <linux/stdarg.h>.
+   - Added LOG_BUF_LEN constant for log buffer sizing.
