@@ -80,8 +80,8 @@ dmesg | tail -5
 Ожидаемый вывод dmesg:
 
 ```
-[DHT]: DHT Driver © 2026, Chapvic (version 2.5)
-[DHT]: driver v2.5 loaded - /proc/sensors/dht/ (max 32 sensors)
+[DHT]: DHT Driver © 2026, Chapvic (v2.5)
+[DHT]: driver loaded - /proc/sensors/dht/ (max 32 sensors)
 ```
 
 ### Выгрузка модуля
