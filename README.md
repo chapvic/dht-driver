@@ -2,7 +2,7 @@
 
 **Version 2.5**  
 **Author: Chapvic**  
-**License: GPL v2**
+**License: GPL v3**
 
 A Linux kernel module for reading temperature and humidity from DHT11, DHT22, and AM2302 sensors connected to Raspberry Pi GPIO pins. The driver exposes a procfs interface under `/proc/sensors/dht/` for sensor registration, configuration, and data retrieval — no device tree overlay required.
 
