@@ -1,0 +1,35 @@
+DHT GPIO Driver — Changelog
+============================
+
+Version 2.5.1 (2026-09-19)
+--------------------------
+
+Bug fix: auto-poll rate limiting
+
+  * Rate limiting (MEAS_MIN_GAP = 2s) now applies to ALL measurement
+    types, not just manual measurements.
+
+  * Previously, the poll thread bypassed rate limiting entirely. When a
+    sensor was registered while global auto-poll was active, the initial
+    measurement during registration succeeded, but the poll thread started
+    immediately and attempted another read ~24 ms later — before the DHT
+    sensor's minimum recovery time (2 s). This caused 3 consecutive read
+    failures (j=0, data=[0,0,0,0,0]) in dmesg right after registration.
+
+  * Fix: dht_do_measurement() now checks the time since last attempt
+    regardless of the "manual" flag. When rate limiting triggers during
+    auto-poll, the measurement is silently skipped (debug message only)
+    and the last successful data is preserved. Manual measurements still
+    return ERR_TOO_SOON as before.
+
+  * Result: after registration with global auto-poll active, dmesg shows:
+      [dht_gpio_23]: measurement OK - H=57.0% T=23.4 C
+      [dht_gpio_23]: auto-poll enabled by global setting
+      [dht_gpio_23]: poll thread started
+      [dht_gpio_23]: registered successfully
+      [dht_gpio_23]: auto-poll skipped - only 0s since last measurement
+      ... (next read after full interval) ...
+      [dht_gpio_23]: measurement OK - H=57.4% T=23.4 C
+
+Files changed: dht.c (dht_do_measurement function, ~5 lines)
+Compatibility: no API changes, fully backward-compatible with v2.5

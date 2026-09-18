@@ -505,8 +505,9 @@ static int dht_read_sensor(int pin, int *hum, int *temp, int *type)
 /**
  * dht_do_measurement - Perform a single sensor measurement and store results
  * @sensor: Pointer to the sensor instance to measure
- * @manual: true if this is a user-triggered manual measurement (subject to rate limiting),
- *          false if this is an automatic background poll (no rate limiting)
+ * @manual: true if this is a user-triggered manual measurement (sets ERR_TOO_SOON
+ *          if rate-limited), false if this is an automatic background poll
+ *          (silently skips if rate-limited)
  *
  * This function is the central measurement dispatcher, called from:
  *   - export_write() during sensor registration (manual = false)
@@ -539,19 +540,24 @@ static void dht_do_measurement(struct dht_sensor *sensor, bool manual)
         return;
     }
 
-    /* Rate limiting: reject manual measurements that come too soon after
-     * the previous attempt. Background polls (manual = false) bypass this. */
-    if (manual) {
-        now = ktime_get_real_seconds();
-        if (sensor->last_attempt_time > 0 &&
-            (now - sensor->last_attempt_time) < MEAS_MIN_GAP) {
+    /* Rate limiting: DHT sensors need at least MEAS_MIN_GAP seconds between
+     * reads. This applies to ALL measurements (manual and auto-poll).
+     * For manual: set ERR_TOO_SOON status. For auto-poll: silently skip
+     * to avoid overwriting the last successful measurement's status. */
+    now = ktime_get_real_seconds();
+    if (sensor->last_attempt_time > 0 &&
+        (now - sensor->last_attempt_time) < MEAS_MIN_GAP) {
+        if (manual) {
             sensor->status_code = ERR_TOO_SOON;
             snprintf(sensor->status_text, STATUS_BUF_LEN, "%s", error_str(ERR_TOO_SOON));
             pin_dbg(sensor->pin, "manual measurement rejected - only %llds since last\n",
                     (long long)(now - sensor->last_attempt_time));
-            mutex_unlock(&sensor->lock);
-            return;
+        } else {
+            pin_dbg(sensor->pin, "auto-poll skipped - only %llds since last measurement\n",
+                    (long long)(now - sensor->last_attempt_time));
         }
+        mutex_unlock(&sensor->lock);
+        return;
     }
 
     /* Record the attempt timestamp for rate limiting */
