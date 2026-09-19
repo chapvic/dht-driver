@@ -21,7 +21,8 @@
  *   - Global auto-poll mode with shared interval
  *   - GPIO chip base caching for fast multi-sensor registration on Pi 3/4/5
  *   - Nanosecond-precision pulse timing for reliable reads across all Pi models
- *   - Rate limiting for manual measurements
+ *   - Rate limiting for all measurements (manual and auto-poll)
+ *   - Safe module unload with module reference counting
  *
  *
  *  /proc/sensors/dht/
@@ -63,11 +64,12 @@
 #include <linux/fs.h>
 #include <linux/time.h>
 #include <linux/ktime.h>
+#include <linux/atomic.h>
 
 /* Driver metadata constants used in MODULE_* macros and dmesg output */
 #define DHT_DRIVER_AUTHOR        "DHT Driver © 2026, Chapvic"
 #define DHT_DRIVER_DESCRIPTION   "DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver"
-#define DHT_DRIVER_VERSION       "2.5"
+#define DHT_DRIVER_VERSION       "2.5.2"
 #define DHT_DRIVER_LICENSE       "GPL"
 
 MODULE_LICENSE(DHT_DRIVER_LICENSE);
@@ -116,13 +118,17 @@ MODULE_VERSION(DHT_DRIVER_VERSION);
  * field names at compile time to maintain backward compatibility.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
-  #define DHT_PROC_OPS    struct proc_ops
-  #define DHT_PROC_READ   .proc_read
-  #define DHT_PROC_WRITE  .proc_write
+  #define DHT_PROC_OPS     struct proc_ops
+  #define DHT_PROC_READ    .proc_read
+  #define DHT_PROC_WRITE   .proc_write
+  #define DHT_PROC_OPEN    .proc_open
+  #define DHT_PROC_RELEASE .proc_release
 #else
-  #define DHT_PROC_OPS    struct file_operations
-  #define DHT_PROC_READ   .read
-  #define DHT_PROC_WRITE  .write
+  #define DHT_PROC_OPS     struct file_operations
+  #define DHT_PROC_READ    .read
+  #define DHT_PROC_WRITE   .write
+  #define DHT_PROC_OPEN    .open
+  #define DHT_PROC_RELEASE .release
 #endif
 
 /*
@@ -226,6 +232,7 @@ static DEFINE_MUTEX(list_lock);              /* Mutex protecting sensor_list and
 static int sensor_count = 0;                 /* Current number of registered sensors */
 static int global_auto_interval = -1;        /* Global auto-poll interval in seconds (-1 = disabled). When active, overrides per-sensor intervals */
 static int cached_chip_base = -1;            /* Cached base GPIO number of the detected Pi GPIO chip. -1 = not yet detected */
+static atomic_t dht_exiting = ATOMIC_INIT(0); /* Flag set during module unload to reject new procfs operations */
 
 /* ── Error text ────────────────────────────────────────────── */
 
@@ -505,14 +512,18 @@ static int dht_read_sensor(int pin, int *hum, int *temp, int *type)
 /**
  * dht_do_measurement - Perform a single sensor measurement and store results
  * @sensor: Pointer to the sensor instance to measure
- * @manual: true if this is a user-triggered manual measurement (sets ERR_TOO_SOON
- *          if rate-limited), false if this is an automatic background poll
- *          (silently skips if rate-limited)
+ * @manual: true if this is a user-triggered manual measurement,
+ *          false if this is an automatic background poll
  *
  * This function is the central measurement dispatcher, called from:
  *   - export_write() during sensor registration (manual = false)
  *   - sensor_measure_write() for user-triggered measurements (manual = true)
  *   - dht_poll_thread_fn() for background polling (manual = false)
+ *
+ * Rate limiting (MEAS_MIN_GAP) applies to ALL measurements. When the gap
+ * is too short:
+ *   - Manual measurements return ERR_TOO_SOON to the user.
+ *   - Auto-poll measurements are silently skipped (last data preserved).
  *
  * It manages locking carefully: acquires sensor->lock for the rate-limit
  * check and for storing results, but releases the lock during the actual
@@ -540,24 +551,26 @@ static void dht_do_measurement(struct dht_sensor *sensor, bool manual)
         return;
     }
 
-    /* Rate limiting: DHT sensors need at least MEAS_MIN_GAP seconds between
-     * reads. This applies to ALL measurements (manual and auto-poll).
-     * For manual: set ERR_TOO_SOON status. For auto-poll: silently skip
-     * to avoid overwriting the last successful measurement's status. */
+    /* Rate limiting: enforce minimum gap between ALL measurements (manual and auto).
+     * DHT sensors need at least 2 seconds between reads to recover. */
     now = ktime_get_real_seconds();
     if (sensor->last_attempt_time > 0 &&
         (now - sensor->last_attempt_time) < MEAS_MIN_GAP) {
         if (manual) {
+            /* Manual measurement: return error to the user */
             sensor->status_code = ERR_TOO_SOON;
             snprintf(sensor->status_text, STATUS_BUF_LEN, "%s", error_str(ERR_TOO_SOON));
             pin_dbg(sensor->pin, "manual measurement rejected - only %llds since last\n",
                     (long long)(now - sensor->last_attempt_time));
+            mutex_unlock(&sensor->lock);
+            return;
         } else {
+            /* Auto-poll: silently skip, keep last successful data */
             pin_dbg(sensor->pin, "auto-poll skipped - only %llds since last measurement\n",
                     (long long)(now - sensor->last_attempt_time));
+            mutex_unlock(&sensor->lock);
+            return;
         }
-        mutex_unlock(&sensor->lock);
-        return;
     }
 
     /* Record the attempt timestamp for rate limiting */
@@ -710,7 +723,10 @@ static void dht_stop_poll(struct dht_sensor *sensor)
  * It is called from:
  *   - export_write() when initial measurement fails after registration
  *   - unexport_write() when the user unregisters a sensor
- *   - dht_driver_exit() during module unload
+ *
+ * Note: dht_driver_exit() does NOT call this function — it performs its own
+ * two-phase cleanup that removes procfs entries before stopping threads,
+ * to prevent race conditions during module unload.
  */
 static void dht_sensor_free(struct dht_sensor *sensor)
 {
@@ -749,6 +765,54 @@ static int dht_parse_int(const char __user *buf, size_t count, int *val)
 
     /* Trim whitespace and convert to a base-10 integer */
     return kstrtoint(strim(in), 10, val) ? -EINVAL : 0;
+}
+
+/* ── Module reference counting for procfs ─────────────────── */
+
+/**
+ * dht_proc_open - Generic open handler that increments the module reference count
+ * @inode: Inode of the procfs entry being opened
+ * @f:     File structure for the opened entry
+ *
+ * This function is wired to ALL procfs entries (both global and per-sensor).
+ * It performs two checks:
+ *   1. If the driver is being unloaded (dht_exiting is set), reject with -ENODEV.
+ *   2. Increment the module reference count via try_module_get() so that rmmod
+ *      cannot remove the module while a procfs file is open.
+ *
+ * The corresponding dht_proc_release() decrements the reference count when
+ * the file is closed.
+ *
+ * Returns: 0 on success, -ENODEV if the driver is being unloaded.
+ */
+static int dht_proc_open(struct inode *inode, struct file *f)
+{
+    /* Reject new opens if the module is being unloaded */
+    if (atomic_read(&dht_exiting))
+        return -ENODEV;
+
+    /* Increment module reference count to prevent rmmod while file is open */
+    if (!try_module_get(THIS_MODULE))
+        return -ENODEV;
+
+    return 0;
+}
+
+/**
+ * dht_proc_release - Generic release handler that decrements the module reference count
+ * @inode: Inode of the procfs entry being closed
+ * @f:     File structure for the closed entry
+ *
+ * This function is the counterpart of dht_proc_open(). It decrements the
+ * module reference count so that rmmod can proceed once all procfs files
+ * are closed.
+ *
+ * Returns: 0 always.
+ */
+static int dht_proc_release(struct inode *inode, struct file *f)
+{
+    module_put(THIS_MODULE);
+    return 0;
 }
 
 /* ── Global procfs: debug ───────────────────────────────────── */
@@ -821,8 +885,10 @@ static ssize_t debug_write(struct file *f, const char __user *buf, size_t count,
 
 /* File operations for the /proc/sensors/dht/debug entry */
 static const DHT_PROC_OPS debug_fops = {
-    DHT_PROC_READ  = debug_read,
-    DHT_PROC_WRITE = debug_write,
+    DHT_PROC_OPEN    = dht_proc_open,
+    DHT_PROC_READ    = debug_read,
+    DHT_PROC_WRITE   = debug_write,
+    DHT_PROC_RELEASE = dht_proc_release,
 };
 
 /* ── Global procfs: version ────────────────────────────────── */
@@ -856,7 +922,9 @@ static ssize_t version_read(struct file *f, char __user *buf, size_t count, loff
 
 /* File operations for the /proc/sensors/dht/version entry */
 static const DHT_PROC_OPS version_fops = {
-    DHT_PROC_READ = version_read,
+    DHT_PROC_OPEN    = dht_proc_open,
+    DHT_PROC_READ    = version_read,
+    DHT_PROC_RELEASE = dht_proc_release,
 };
 
 /* ── Global procfs: auto_interval ──────────────────────────── */
@@ -941,8 +1009,10 @@ static ssize_t auto_interval_write(struct file *f, const char __user *buf, size_
 
 /* File operations for the /proc/sensors/dht/auto_interval entry */
 static const DHT_PROC_OPS auto_interval_fops = {
-    DHT_PROC_READ  = auto_interval_read,
-    DHT_PROC_WRITE = auto_interval_write,
+    DHT_PROC_OPEN    = dht_proc_open,
+    DHT_PROC_READ    = auto_interval_read,
+    DHT_PROC_WRITE   = auto_interval_write,
+    DHT_PROC_RELEASE = dht_proc_release,
 };
 
 /* ── Per-sensor procfs handlers ────────────────────────────── */
@@ -1284,14 +1354,14 @@ static ssize_t sensor_info_read(struct file *f, char __user *buf, size_t count, 
  * Each entry below binds a procfs file to its read/write handler functions.
  * These are used by proc_create_data() to set up the per-sensor proc entries.
  */
-static const DHT_PROC_OPS sensor_pin_fops         = { DHT_PROC_READ = sensor_pin_read };
-static const DHT_PROC_OPS sensor_interval_fops    = { DHT_PROC_READ = sensor_interval_read, DHT_PROC_WRITE = sensor_interval_write };
-static const DHT_PROC_OPS sensor_measure_fops     = { DHT_PROC_WRITE = sensor_measure_write };
-static const DHT_PROC_OPS sensor_status_code_fops = { DHT_PROC_READ = sensor_status_code_read };
-static const DHT_PROC_OPS sensor_status_text_fops = { DHT_PROC_READ = sensor_status_text_read };
-static const DHT_PROC_OPS sensor_value_fops       = { DHT_PROC_READ = sensor_value_read };
-static const DHT_PROC_OPS sensor_info_fops        = { DHT_PROC_READ = sensor_info_read };
-static const DHT_PROC_OPS sensor_timestamp_fops   = { DHT_PROC_READ = sensor_last_meas_time_read };
+static const DHT_PROC_OPS sensor_pin_fops         = { DHT_PROC_OPEN = dht_proc_open, DHT_PROC_READ = sensor_pin_read, DHT_PROC_RELEASE = dht_proc_release };
+static const DHT_PROC_OPS sensor_interval_fops    = { DHT_PROC_OPEN = dht_proc_open, DHT_PROC_READ = sensor_interval_read, DHT_PROC_WRITE = sensor_interval_write, DHT_PROC_RELEASE = dht_proc_release };
+static const DHT_PROC_OPS sensor_measure_fops     = { DHT_PROC_OPEN = dht_proc_open, DHT_PROC_WRITE = sensor_measure_write, DHT_PROC_RELEASE = dht_proc_release };
+static const DHT_PROC_OPS sensor_status_code_fops = { DHT_PROC_OPEN = dht_proc_open, DHT_PROC_READ = sensor_status_code_read, DHT_PROC_RELEASE = dht_proc_release };
+static const DHT_PROC_OPS sensor_status_text_fops = { DHT_PROC_OPEN = dht_proc_open, DHT_PROC_READ = sensor_status_text_read, DHT_PROC_RELEASE = dht_proc_release };
+static const DHT_PROC_OPS sensor_value_fops       = { DHT_PROC_OPEN = dht_proc_open, DHT_PROC_READ = sensor_value_read, DHT_PROC_RELEASE = dht_proc_release };
+static const DHT_PROC_OPS sensor_info_fops        = { DHT_PROC_OPEN = dht_proc_open, DHT_PROC_READ = sensor_info_read, DHT_PROC_RELEASE = dht_proc_release };
+static const DHT_PROC_OPS sensor_timestamp_fops   = { DHT_PROC_OPEN = dht_proc_open, DHT_PROC_READ = sensor_last_meas_time_read, DHT_PROC_RELEASE = dht_proc_release };
 
 /* ── Proc entry tables ────────────────────────────────────── */
 
@@ -1546,12 +1616,16 @@ static ssize_t unexport_write(struct file *f, const char __user *buf, size_t cou
 
 /* File operations for the /proc/sensors/dht/export entry (write-only) */
 static const DHT_PROC_OPS export_fops = {
-    DHT_PROC_WRITE = export_write,
+    DHT_PROC_OPEN    = dht_proc_open,
+    DHT_PROC_WRITE   = export_write,
+    DHT_PROC_RELEASE = dht_proc_release,
 };
 
 /* File operations for the /proc/sensors/dht/unexport entry (write-only) */
 static const DHT_PROC_OPS unexport_fops = {
-    DHT_PROC_WRITE = unexport_write,
+    DHT_PROC_OPEN    = dht_proc_open,
+    DHT_PROC_WRITE   = unexport_write,
+    DHT_PROC_RELEASE = dht_proc_release,
 };
 
 /* ── Module init / exit ────────────────────────────────────── */
@@ -1635,38 +1709,62 @@ static int __init dht_driver_init(void)
 /**
  * dht_driver_exit - Module cleanup function
  *
- * Called when the module is unloaded (rmmod). Performs a clean teardown:
- *   1. Moves all sensors from the global list to a temporary list (under lock)
- *   2. Frees each sensor (stops poll threads, removes procfs entries, frees memory)
- *   3. Removes the driver's procfs directories
+ * Called when the module is unloaded (rmmod). Performs a safe two-phase
+ * teardown to prevent race conditions with concurrent procfs operations:
  *
- * The temporary list is used so the list_lock mutex is only held during
- * the list splice operation, not during the potentially slow sensor cleanup
- * (which includes kthread_stop that may sleep).
+ * Phase 1 — Block new access and remove procfs:
+ *   1. Set dht_exiting flag (new dht_proc_open calls return -ENODEV)
+ *   2. Disable global auto-poll (prevents new thread launches)
+ *   3. Remove ALL procfs entries (proc_remove blocks until open files close)
+ *
+ * Phase 2 — Stop threads and free memory:
+ *   4. Splice sensor list under lock (no new sensors can appear — procfs gone)
+ *   5. For each sensor: stop poll thread, destroy mutex, free memory
+ *
+ * The key insight: after Phase 1, no new file operations can start because
+ * all procfs entries are removed. The module reference count (incremented
+ * by dht_proc_open) prevents rmmod from proceeding until all open files
+ * are closed. By the time Phase 2 runs, it is safe to free sensor memory.
  */
 static void __exit dht_driver_exit(void)
 {
     LIST_HEAD(tmp_list);
     struct dht_sensor *sensor, *tmp;
 
-    /* Splice the entire sensor list into a temporary list under the lock.
-     * This empties the global list atomically, so no new operations can
-     * find sensors while we clean them up. */
+    /* ── Phase 1: Block new access and remove procfs ── */
+
+    /* Set the exiting flag so dht_proc_open rejects any new file opens */
+    atomic_set(&dht_exiting, 1);
+
+    /* Disable global auto-poll so poll threads won't start new measurements */
+    WRITE_ONCE(global_auto_interval, -1);
+
+    /* Remove all procfs entries at once. proc_remove(proc_dir) removes
+     * /proc/sensors/dht/ and all subdirectories (gpio<pin>/) and files
+     * beneath it. This call blocks until all currently open procfs files
+     * are closed (their release handlers call module_put, decrementing
+     * the module reference count). */
+    proc_remove(proc_dir);
+    proc_remove(proc_parent);
+
+    /* ── Phase 2: Stop threads and free memory ── */
+
+    /* Splice the sensor list under the lock. After proc_remove, no new
+     * file operations can reach the sensors, so this is safe. */
     mutex_lock(&list_lock);
     list_splice_init(&sensor_list, &tmp_list);
     sensor_count = 0;
     mutex_unlock(&list_lock);
 
-    /* Free each sensor in the temporary list (outside the lock,
-     * since dht_stop_poll / kthread_stop may sleep) */
+    /* Free each sensor: stop poll thread (may sleep up to ~400 ms for
+     * kthread_stop), destroy mutex, free memory. No lock needed since
+     * the list is private (tmp_list) and no procfs access is possible. */
     list_for_each_entry_safe(sensor, tmp, &tmp_list, list) {
         list_del(&sensor->list);
-        dht_sensor_free(sensor);
+        dht_stop_poll(sensor);
+        mutex_destroy(&sensor->lock);
+        kfree(sensor);
     }
-
-    /* Remove the driver's procfs directories */
-    proc_remove(proc_dir);
-    proc_remove(proc_parent);
 
     dht_info("driver unloaded\n");
 }

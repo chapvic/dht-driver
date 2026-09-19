@@ -1,0 +1,66 @@
+DHT GPIO Driver — Changelog
+============================
+
+Version 2.5.2 (2026-09-19)
+--------------------------
+
+Bug fix: safe module unloading
+
+  * Fixed a race condition where rmmod could fail with EBUSY or cause
+    a use-after-free when procfs files were accessed during module exit.
+
+  * Root cause: the driver did not set .owner in proc_ops, so the kernel
+    had no way to track active file references. The exit function could
+    start freeing sensor structures while a procfs read/write handler
+    was still executing. Additionally, global proc entries (export,
+    unexport, auto_interval, debug) remained accessible while
+    dht_sensor_free() was blocking on kthread_stop() (up to ~400 ms),
+    allowing new registrations to leak.
+
+  * Three-layer protection implemented:
+
+    Layer 1 — Module reference counting (primary defense):
+      - Added generic dht_proc_open() and dht_proc_release() handlers
+        wired into ALL 13 proc entries (5 global + 8 per-sensor).
+      - dht_proc_open() calls try_module_get(); dht_proc_release()
+        calls module_put(). While any procfs file is open, rmmod
+        receives EBUSY from the kernel — standard Linux module
+        self-protection mechanism.
+
+    Layer 2 — Atomic exit flag (additional barrier):
+      - Added static atomic_t dht_exiting, set to 1 in the very
+        first line of dht_driver_exit().
+      - dht_proc_open() checks this flag and returns -ENODEV
+        immediately, closing the microsecond window between the
+        kernel checking module_refcount == 0 and calling exit.
+
+    Layer 3 — Two-phase cleanup in dht_driver_exit():
+      Phase 1 (block & remove):
+        1. atomic_set(&dht_exiting, 1) — new open() calls rejected
+        2. WRITE_ONCE(global_auto_interval, -1) — poll threads stop
+           starting new measurements
+        3. proc_remove(proc_dir) — removes /proc/sensors/dht/ and all
+           child entries; blocks until all open files are closed
+        4. proc_remove(proc_parent) — removes /proc/sensors
+      Phase 2 (stop & free):
+        5. list_splice_init() under list_lock — atomically detaches
+           the entire sensor list
+        6. For each sensor: dht_stop_poll() → mutex_destroy() → kfree()
+      After Phase 1, no file operation can reach sensor data, making
+      Phase 2 safe without per-sensor proc_remove().
+
+  * dht_sensor_free() unchanged — still used by export_write()
+    (on duplicate registration) and unexport_write() for individual
+    sensor cleanup. Only dht_driver_exit() was restructured.
+
+  * Net effect: rmmod now succeeds on the first attempt when no files
+    are open, or returns EBUSY immediately if any file is open. No
+    retries needed. No memory leaks. No use-after-free.
+
+Also includes: v2.5.1 (auto-poll rate limiting)
+  Rate limiting (MEAS_MIN_GAP = 2s) now applies to ALL measurement
+  types. Auto-poll silently skips with a debug message instead of
+  forcing 3 failed retries immediately after registration.
+
+Files changed: dht.c
+Compatibility: no API changes, fully backward-compatible with v2.5
