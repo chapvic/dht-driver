@@ -1,26 +1,48 @@
 # DHT11/DHT22/AM2302 Linux Kernel Driver
 
-**Version 2.5**  
-**Author: Chapvic**  
-**License: GPL v3**
+A Linux kernel module for reading temperature and humidity data from DHT11, DHT22, and AM2302 sensors connected to Raspberry Pi GPIO pins. The driver exposes a procfs interface under `/proc/sensors/dht/` for managing sensor registration, configuration, and data retrieval.
 
-A Linux kernel module for reading temperature and humidity from DHT11, DHT22, and AM2302 sensors connected to Raspberry Pi GPIO pins. The driver exposes a procfs interface under `/proc/sensors/dht/` for sensor registration, configuration, and data retrieval — no device tree overlay required.
+**Version:** 2.6  
+**Author:** Chapvic  
+**License:** GPL v3  
+**Copyright:** © 2026
 
 ---
 
 ## Table of Contents
 
+- [Overview](#overview)
 - [Supported Hardware](#supported-hardware)
-- [Building and Installing](#building-and-installing)
-- [Procfs Interface](#procfs-interface)
+- [Wiring](#wiring)
 - [Quick Start](#quick-start)
+- [Procfs Interface](#procfs-interface)
 - [Usage Examples](#usage-examples)
+- [Error Codes](#error-codes)
 - [Configuration](#configuration)
 - [Debug Mode](#debug-mode)
-- [Error Codes](#error-codes)
-- [Technical Details](#technical-details)
-- [Limitations and Notes](#limitations-and-notes)
+- [Architecture](#architecture)
+- [Version History](#version-history)
+- [Known Limitations](#known-limitations)
 - [Troubleshooting](#troubleshooting)
+- [Files in This Release](#files-in-this-release)
+- [Build Requirements](#build-requirements)
+- [License](#license)
+- [Acknowledgements](#acknowledgements)
+
+---
+
+## Overview
+
+The DHT driver is a Linux kernel module that communicates with DHT11, DHT22, and AM2302 temperature and humidity sensors over the single-wire GPIO protocol. It provides:
+
+- **Dynamic sensor registration** via procfs export/unexport mechanism (similar to GPIO sysfs)
+- **Per-sensor proc entries** for temperature, humidity, status, configuration, and metadata
+- **Background polling** with per-sensor or global auto-poll intervals
+- **Nanosecond-precision pulse timing** for reliable reads across all Raspberry Pi models
+- **GPIO chip base caching** for fast multi-sensor registration on Pi 3/4/5
+- **Rate limiting** for all measurements (manual and auto-poll)
+- **Safe module unload** with module reference counting — `rmmod` blocks while procfs files are open
+- **Shared `/proc/sensors`** — coexists with other sensor drivers without conflict
 
 ---
 
@@ -28,530 +50,652 @@ A Linux kernel module for reading temperature and humidity from DHT11, DHT22, an
 
 ### Sensors
 
-| Sensor | Temperature Range | Humidity Range | Resolution | Data Format |
-|--------|-------------------|----------------|------------|-------------|
-| DHT11  | 0–50 °C           | 20–90 % RH     | 1 °C / 1 % | 8-bit integer, no decimals |
-| DHT22  | −40–80 °C         | 0–100 % RH     | 0.1 °C / 0.1 % | 16-bit, signed temp |
-| AM2302 | −40–80 °C         | 0–100 % RH     | 0.1 °C / 0.1 % | Same as DHT22 (wired version) |
+| Sensor | Humidity Range | Temperature Range | Resolution | Protocol |
+|--------|---------------|-------------------|------------|----------|
+| DHT11 | 20–90% RH | 0–50 °C | Integer (1% / 1 °C) | Single-wire, 40-bit |
+| DHT22 (AM2302) | 0–100% RH | −40–80 °C | Decimal (0.1% / 0.1 °C) | Single-wire, 40-bit |
 
-The driver auto-detects the sensor type based on the data format returned by the sensor:
-- If humidity value exceeds 1000 (i.e. raw 16-bit value > 1000), the sensor is treated as **DHT11** (8-bit integer format).
-- Otherwise, the sensor is treated as **DHT22/AM2302** (16-bit format with decimal precision).
+Sensor type is auto-detected on the first successful measurement based on the data format.
 
 ### Raspberry Pi Models
 
-| Model | SoC | GPIO Chip | Notes |
-|-------|-----|-----------|-------|
-| Pi 3 / Pi 3+ | BCM2837 | `pinctrl-bcm2835` | Direct GPIO lookup, base = 0 |
-| Pi 4 / Pi 4+ | BCM2711 | `pinctrl-bcm2711` | Direct GPIO lookup, base = 0 |
-| Pi 5 | BCM2712 | `pinctrl-rp1` | Requires full scan, base ≠ 0 |
+| Model | GPIO Chip Label | Base Offset | Notes |
+|-------|----------------|-------------|-------|
+| Pi 5 | `pinctrl-rp1` / `pinctrl-bcm2712` | ≥ 512 | RP1 south bridge, large base offset |
+| Pi 4 | `pinctrl-bcm2711` | 0 | Standard BCM numbering |
+| Pi 3 / Pi 2 | `pinctrl-bcm2835` | 0 | Standard BCM numbering |
+| Pi 1 / Pi Zero | `pinctrl-bcm2835` | 0 | Standard BCM numbering |
 
-The driver caches the GPIO chip base number after the first successful sensor registration, so subsequent registrations are instant.
+The driver uses a three-stage GPIO lookup strategy (see [Architecture](#architecture)) to handle the different base offsets across Pi models automatically.
+
+### Valid GPIO Pins
+
+BCM pin numbers **0–27** are supported. These correspond to the 28 GPIO pins exposed on the Raspberry Pi 40-pin header.
 
 ---
 
-## Building and Installing
+## Wiring
 
-### Prerequisites
+Connect the DHT sensor to the Raspberry Pi as follows:
 
-- Linux kernel headers matching your running kernel
-- `gcc` and `make`
+```
+DHT Sensor          Raspberry Pi GPIO
+──────────          ──────────────────
+VCC (Pin 1)  ────── 3.3V (Pin 1 or 17)
+DATA (Pin 2) ────── BCM GPIO pin of your choice (e.g., GPIO23 = Pin 16)
+GND (Pin 4)  ────── GND (Pin 6 or 9)
+```
 
-On Raspberry Pi OS:
+**Pull-up resistor:** A 4.7 kΩ – 10 kΩ pull-up resistor between DATA and VCC is required. Some sensor breakout boards (e.g., AM2302) include this resistor on-board.
+
+```
+                    3.3V
+                      │
+                     ┌─┐
+                     │ │ 4.7k–10k
+                     │ │
+                     └─┘
+                      │
+    GPIO pin ─────────┼──────── DATA pin
+```
+
+> **Note:** Do not use 5 V power for the sensor data line — Raspberry Pi GPIO pins are not 5 V tolerant. Power the sensor from 3.3 V.
+
+---
+
+## Quick Start
+
+### 1. Install kernel headers
 
 ```bash
 sudo apt install linux-headers-$(uname -r) build-essential
 ```
 
-### Build
+### 2. Build the module
 
 ```bash
-cd dht_driver
 make
 ```
 
-### Install
-
-```bash
-sudo make install
-sudo modprobe dht
-```
-
-Or load manually:
+### 3. Load the driver
 
 ```bash
 sudo insmod dht.ko
 ```
 
-### Unload
+Verify in dmesg:
+
+```bash
+dmesg | tail -5
+# [DHT]: DHT Driver © 2026, Chapvic (v2.6)
+# [DHT]: driver loaded - /proc/sensors/dht/ (max 32 sensors)
+```
+
+### 4. Register a sensor
+
+```bash
+echo 23 | sudo tee /proc/sensors/dht/export
+# [dht_gpio_23]: registered successfully
+```
+
+### 5. Read temperature and humidity
+
+```bash
+cat /proc/sensors/dht/gpio23/value
+# H=45.2
+# T=23.1
+```
+
+### 6. Enable auto-polling (optional)
+
+```bash
+# Per-sensor auto-poll every 5 seconds
+echo 5 | sudo tee /proc/sensors/dht/gpio23/interval
+
+# Or global auto-poll for all sensors
+echo 5 | sudo tee /proc/sensors/dht/auto_interval
+```
+
+### 7. Unregister a sensor
+
+```bash
+echo 23 | sudo tee /proc/sensors/dht/unexport
+# [dht_gpio_23]: unregistered
+```
+
+### 8. Unload the driver
 
 ```bash
 sudo rmmod dht
-```
-
-### Load at Boot (optional)
-
-```bash
-echo "dht" | sudo tee /etc/modules-load.d/dht.conf
-sudo cp dht.ko /lib/modules/$(uname -r)/extra/
-sudo depmod -a
+# [DHT]: driver unloaded
 ```
 
 ---
 
 ## Procfs Interface
 
-The driver creates entries under `/proc/sensors/dht/`.
+The driver creates entries under `/proc/sensors/dht/`. If another sensor driver has already created `/proc/sensors/`, the DHT driver reuses it. The parent directory is only removed on unload if the DHT driver created it and no other subdirectories remain.
 
-### Global Entries
+### Global Entries — `/proc/sensors/dht/`
 
-| Path | Mode | Description |
-|------|------|-------------|
-| `/proc/sensors/dht/debug` | rw (0666) | Debug logging: `0` = off (default), `1` = on |
-| `/proc/sensors/dht/version` | r (0444) | Driver version string |
-| `/proc/sensors/dht/export` | w (0222) | Write BCM pin number to register a new sensor |
-| `/proc/sensors/dht/unexport` | w (0222) | Write BCM pin number to unregister a sensor |
-| `/proc/sensors/dht/auto_interval` | rw (0666) | Global auto-poll interval in seconds (2–60). Write `-1` to disable. |
+| Entry | Permissions | Type | Description |
+|-------|-------------|------|-------------|
+| `debug` | `0666` (rw) | int | Debug logging: `0` = off (default), `1` = on |
+| `version` | `0444` (r) | string | Driver version string |
+| `export` | `0222` (w) | int | Write BCM pin number to register a new sensor |
+| `unexport` | `0222` (w) | int | Write BCM pin number to unregister a sensor |
+| `auto_interval` | `0666` (rw) | int | Global auto-poll interval in seconds (`2`–`60`, `-1` = off) |
 
-### Per-Sensor Entries
+### Per-Sensor Entries — `/proc/sensors/dht/gpio<pin>/`
 
-Each registered sensor gets a directory at `/proc/sensors/dht/gpio<pin>/`:
+| Entry | Permissions | Type | Description |
+|-------|-------------|------|-------------|
+| `pin` | `0444` (r) | int | BCM GPIO pin number |
+| `interval` | `0644` (rw) | int | Per-sensor auto-poll interval (`2`–`60`, `-1` = off) |
+| `measure` | `0222` (w) | int | Write `1` to trigger a manual measurement |
+| `status_code` | `0444` (r) | int | Error code from last measurement (`0` = success) |
+| `status_text` | `0444` (r) | string | Human-readable status description |
+| `value` | `0444` (r) | string | `H=<humidity>\nT=<temperature>\n` |
+| `info` | `0444` (r) | string | Sensor type and registration timestamp |
+| `timestamp` | `0444` (r) | int | Unix timestamp of last successful measurement |
 
-| Path | Mode | Description |
-|------|------|-------------|
-| `pin` | r (0444) | BCM GPIO pin number |
-| `interval` | rw (0644) | Auto-poll interval in seconds (2–60, `-1` = off) |
-| `measure` | w (0222) | Write `1` to trigger a manual measurement. Ignored if auto-poll is active. |
-| `status_code` | r (0444) | Numeric error code (0 = success) |
-| `status_text` | r (0444) | Human-readable error description |
-| `value` | r (0444) | Sensor readings: `H=<humidity>\nT=<temperature>\n` |
-| `info` | r (0444) | Sensor type and registration timestamp |
-| `timestamp` | r (0444) | Unix timestamp of the last successful measurement |
+### Directory Structure
 
----
-
-## Quick Start
-
-```bash
-# 1. Load the driver
-sudo insmod dht.ko
-
-# 2. Register a sensor on GPIO 23
-echo 23 | sudo tee /proc/sensors/dht/export
-
-# 3. Read temperature and humidity
-cat /proc/sensors/dht/gpio23/value
-
-# 4. Unregister the sensor
-echo 23 | sudo tee /proc/sensors/dht/unexport
 ```
+/proc/sensors/
+└── dht/
+    ├── debug            (rw)  — debug logging toggle
+    ├── version          (r)   — driver version
+    ├── export           (w)   — register sensor by BCM pin
+    ├── unexport         (w)   — unregister sensor by BCM pin
+    ├── auto_interval    (rw)  — global auto-poll interval
+    ├── gpio4/           — one directory per registered sensor
+    │   ├── pin          (r)
+    │   ├── interval     (rw)
+    │   ├── measure      (w)
+    │   ├── status_code  (r)
+    │   ├── status_text  (r)
+    │   ├── value        (r)
+    │   ├── info         (r)
+    │   └── timestamp    (r)
+    ├── gpio17/
+    │   └── ...
+    └── gpio23/
+        └── ...
+```
+
+### Polling Priority
+
+| Mode | Condition | Behavior |
+|------|-----------|----------|
+| Global auto-poll | `auto_interval` is `2`–`60` | All sensors polled at the shared interval. Per-sensor `interval` is stored but ignored. |
+| Per-sensor auto-poll | `auto_interval` = `-1`, sensor `interval` = `2`–`60` | Only that sensor is polled at its own interval. |
+| Manual mode | `auto_interval` = `-1`, sensor `interval` = `-1` | User triggers measurements by writing `1` to `measure`. |
+
+Manual measurements are rejected with `ERR_AUTO_MODE` if either per-sensor or global auto-poll is active.
 
 ---
 
 ## Usage Examples
 
-### Register a Sensor
+### Manual Single Read
 
 ```bash
+# Register sensor on GPIO23
 echo 23 | sudo tee /proc/sensors/dht/export
-```
 
-Expected dmesg output:
-
-```
-[dht_gpio_23]: found on 'pinctrl-bcm2835' (base=512, global=535)
-[dht_gpio_23]: registered successfully
-```
-
-### Read Current Values
-
-```bash
-cat /proc/sensors/dht/gpio23/value
-```
-
-Output:
-
-```
-H=45.2
-T=23.1
-```
-
-- `H` — humidity with one decimal place
-- `T` — temperature in °C with one decimal place (negative for sub-zero)
-
-### Manual Single Measurement
-
-```bash
+# Trigger a measurement
 echo 1 | sudo tee /proc/sensors/dht/gpio23/measure
+
+# Read the result
 cat /proc/sensors/dht/gpio23/value
+# H=45.2
+# T=23.1
+
+# Check status
+cat /proc/sensors/dht/gpio23/status_text
+# SUCCESS
 ```
 
-Manual measurement is only available when auto-poll is disabled (interval = `-1` and global auto_interval = `-1`). A minimum gap of 2 seconds is enforced between manual measurements.
-
-### Enable Auto-Polling (Per-Sensor)
+### Per-Sensor Auto-Poll
 
 ```bash
-echo 5 | sudo tee /proc/sensors/dht/gpio23/interval
+# Register and enable polling every 10 seconds
+echo 4 | sudo tee /proc/sensors/dht/export
+echo 10 | sudo tee /proc/sensors/dht/gpio4/interval
+
+# Values are updated automatically — just read them
+cat /proc/sensors/dht/gpio4/value
+# H=52.3
+# T=19.7
+
+# Check last measurement timestamp
+cat /proc/sensors/dht/gpio4/timestamp
+# 1779000123
+
+# Disable polling for this sensor
+echo -1 | sudo tee /proc/sensors/dht/gpio4/interval
 ```
 
-This starts a background kernel thread that reads the sensor every 5 seconds. To stop:
+### Global Auto-Poll for All Sensors
 
 ```bash
-echo -1 | sudo tee /proc/sensors/dht/gpio23/interval
-```
+# Register multiple sensors
+echo 4  | sudo tee /proc/sensors/dht/export
+echo 17 | sudo tee /proc/sensors/dht/export
+echo 23 | sudo tee /proc/sensors/dht/export
 
-### Enable Global Auto-Polling
+# Enable global auto-poll every 5 seconds
+echo 5 | sudo tee /proc/sensors/dht/auto_interval
 
-```bash
-echo 10 | sudo tee /proc/sensors/dht/auto_interval
-```
+# All three sensors now poll every 5 seconds
+cat /proc/sensors/dht/gpio4/value
+cat /proc/sensors/dht/gpio17/value
+cat /proc/sensors/dht/gpio23/value
 
-This enables auto-polling for **all** registered sensors with a shared 10-second interval. Sensors that were not polling will start automatically. Per-sensor intervals are ignored while global auto-poll is active.
-
-To disable:
-
-```bash
+# Disable global auto-poll
 echo -1 | sudo tee /proc/sensors/dht/auto_interval
 ```
 
-### Check Sensor Status
+### Parsing Values in a Shell Script
 
 ```bash
-cat /proc/sensors/dht/gpio23/status_code
-cat /proc/sensors/dht/gpio23/status_text
+#!/bin/bash
+SENSOR="/proc/sensors/dht/gpio23/value"
+
+read_humidity() {
+    awk -F= '/^H=/ {print $2}' "$SENSOR"
+}
+
+read_temperature() {
+    awk -F= '/^T=/ {print $2}' "$SENSOR"
+}
+
+H=$(read_humidity)
+T=$(read_temperature)
+echo "Humidity: ${H}%, Temperature: ${T}°C"
 ```
 
-Output:
+### Python Example
 
-```
-0
-SUCCESS
+```python
+def read_dht(pin):
+    with open(f"/proc/sensors/dht/gpio{pin}/value") as f:
+        data = {}
+        for line in f:
+            key, val = line.strip().split("=")
+            data[key] = float(val)
+    return data["H"], data["T"]
+
+h, t = read_dht(23)
+print(f"Humidity: {h}%, Temperature: {t}C")
 ```
 
-### View Sensor Info
+### Safe Unload
 
 ```bash
-cat /proc/sensors/dht/gpio23/info
+# The driver refuses to unload if any procfs file is open:
+tail -f /proc/sensors/dht/gpio23/value &
+sudo rmmod dht
+# ERROR: Module dht is in use
+
+# Close the file, then unload:
+kill %1
+sudo rmmod dht
+# [DHT]: driver unloaded
 ```
-
-Output:
-
-```
-Sensor type: DHT11
-Register time: 2026-09-18T14:32:05Z
-```
-
-### Check Last Measurement Time
-
-```bash
-cat /proc/sensors/dht/gpio23/timestamp
-```
-
-Output (Unix timestamp):
-
-```
-1726667525
-```
-
-### Register Multiple Sensors
-
-```bash
-echo 23 | sudo tee /proc/sensors/dht/export
-echo 24 | sudo tee /proc/sensors/dht/export
-echo 25 | sudo tee /proc/sensors/dht/export
-
-# Enable global polling for all at once
-echo 5 | sudo tee /proc/sensors/dht/auto_interval
-
-# Read each sensor
-cat /proc/sensors/dht/gpio23/value
-cat /proc/sensors/dht/gpio24/value
-cat /proc/sensors/dht/gpio25/value
-```
-
-### Unregister a Sensor
-
-```bash
-echo 23 | sudo tee /proc/sensors/dht/unexport
-```
-
-Expected dmesg output:
-
-```
-[dht_gpio_23]: unregistered
-```
-
----
-
-## Configuration
-
-### Module Parameters
-
-| Parameter | Default | Description |
-|----------|---------|-------------|
-| `dht_debug` | 0 | Enable debug logging at load time (`insmod dht.ko dht_debug=1`) |
-
-### Compile-Time Constants
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `MAX_SENSORS` | 32 | Maximum number of simultaneously registered sensors |
-| `MAX_PIN_NUM` | 27 | Maximum BCM GPIO pin number |
-| `MIN_INTERVAL` | 2 | Minimum poll interval in seconds |
-| `MAX_INTERVAL` | 60 | Maximum poll interval in seconds |
-| `MEAS_MIN_GAP` | 2 | Minimum seconds between manual measurements |
-| `MAX_RETRIES` | 3 | Read attempts before giving up |
-| `RETRY_DELAY_MS` | 100 | Delay between retry attempts |
-| `BIT_THRESHOLD` | 40000 ns | Pulse width threshold: < 40 µs = bit 0, > 40 µs = bit 1 |
-| `PULSE_TIMEOUT_NS` | 200000 ns | Maximum pulse width before timeout (200 µs) |
-| `MAX_TIMINGS` | 100 | Maximum edge transitions to capture |
-
----
-
-## Debug Mode
-
-Enable debug logging to see measurement results, retry attempts, and diagnostic information in dmesg.
-
-### Enable via procfs (runtime):
-
-```bash
-echo 1 | sudo tee /proc/sensors/dht/debug
-```
-
-### Enable at module load:
-
-```bash
-sudo insmod dht.ko dht_debug=1
-```
-
-### Disable:
-
-```bash
-echo 0 | sudo tee /proc/sensors/dht/debug
-```
-
-### Debug Output Example
-
-```
-[dht_gpio_23]: found on 'pinctrl-bcm2835' (base=512, global=535)
-[dht_gpio_23]: measurement OK - H=45.2% T=23.1 C
-[dht_gpio_23]: registered successfully
-[dht_gpio_23]: auto-poll enabled (interval=5)
-[DHT]: debug enabled
-[dht_gpio_23]: measurement OK - H=45.1% T=23.0 C
-[dht_gpio_23]: measurement OK - H=45.3% T=23.1 C
-```
-
-If a read fails, debug output shows diagnostic data:
-
-```
-[dht_gpio_23]: read attempt 1 failed - j=39, data=[35,0,48,0,59]
-[dht_gpio_23]: read attempt 2 failed - j=38, data=[34,0,48,0,58]
-[dht_gpio_23]: read attempt 3 failed - j=40, data=[35,0,48,0,59]
-[dht_gpio_23]: read failed after 3 attempts - j=40, data=[35,0,48,0,59]
-[dht_gpio_23]: measurement failed - Sensor data read failed
-```
-
-- `j` — number of bits successfully read (40 = complete frame)
-- `data[0..3]` — raw humidity and temperature bytes
-- `data[4]` — checksum byte
 
 ---
 
 ## Error Codes
 
+### Driver Error Codes
+
+These are the values returned in the `status_code` proc entry:
+
 | Code | Constant | Description |
 |------|----------|-------------|
-| 0 | `ERR_SUCCESS` | Measurement succeeded |
-| 1 | `ERR_PIN_INVALID` | Pin number out of range (0–27) |
-| 2 | `ERR_GPIO_REQUEST` | GPIO descriptor lookup or direction set failed |
-| 3 | `ERR_READ_FAILED` | Sensor data read failed after all retries |
-| 4 | `ERR_AUTO_MODE` | Manual measure rejected because auto-poll is active |
-| 5 | `ERR_TOO_SOON` | Manual measure rejected: less than 2 seconds since last attempt |
+| 0 | `ERR_SUCCESS` | Operation completed successfully |
+| 1 | `ERR_PIN_INVALID` | The specified GPIO pin number is out of valid range (0–27) |
+| 2 | `ERR_GPIO_REQUEST` | Failed to request or find the GPIO descriptor |
+| 3 | `ERR_READ_FAILED` | Sensor data read failed (checksum error, timeout, etc.) — all 3 retry attempts exhausted |
+| 4 | `ERR_AUTO_MODE` | Manual measurement attempted while auto-poll is active |
+| 5 | `ERR_TOO_SOON` | Manual measurement rejected due to rate limiting (minimum 2 s between measurements) |
 
-### Reading Error Status
+### Export/Unexport errno Values
 
-```bash
-cat /proc/sensors/dht/gpio23/status_code   # numeric code
-cat /proc/sensors/dht/gpio23/status_text   # text description
-```
+When writing to `export` or `unexport`, the kernel may return these standard `errno` values:
+
+| errno | Meaning |
+|-------|---------|
+| `-EIO` | Initial measurement failed — sensor not registered |
+| `-EINVAL` | Invalid pin number or format |
+| `-ENODEV` | Pin not currently registered (unexport) |
+| `-ENOMEM` | Out of memory or procfs entry creation failed |
+| `-EBUSY` | Pin already registered (export) |
 
 ---
 
-## Technical Details
+## Configuration
 
-### DHT Protocol
+### Module Parameter
 
-The DHT11/DHT22/AM2302 protocol uses a single-wire bidirectional interface:
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `dht_debug` | int | `0` | Debug logging: `0` = off, `1` = on. Can also be toggled at runtime via `/proc/sensors/dht/debug`. |
 
-1. **Start signal**: MCU pulls the data line low for ≥18 ms (driver uses 20 ms), then releases it.
-2. **Sensor response**: Sensor pulls low for ~80 µs, then high for ~80 µs.
-3. **Data transmission**: 40 bits (5 bytes), MSB first. Each bit is preceded by a ~50 µs low pulse. Bit value is determined by the duration of the high pulse:
-   - **Bit 0**: ~26 µs high
-   - **Bit 1**: ~70 µs high
-4. **Checksum**: Sum of the first 4 bytes modulo 256 must equal the 5th byte.
+```bash
+# Load with debug enabled
+sudo insmod dht.ko dht_debug=1
 
-### Data Format
-
-**DHT11** (8-bit integer):
-```
-Byte 0: Humidity integer part
-Byte 1: Humidity decimal part (always 0)
-Byte 2: Temperature integer part
-Byte 3: Temperature decimal part (always 0)
-Byte 4: Checksum
+# Toggle at runtime
+echo 1 | sudo tee /proc/sensors/dht/debug
+echo 0 | sudo tee /proc/sensors/dht/debug
 ```
 
-**DHT22/AM2302** (16-bit):
+### Compile-Time Constants
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `MAX_SENSORS` | 32 | Maximum number of simultaneously registered sensors |
+| `MAX_PIN_NUM` | 27 | Highest valid BCM GPIO pin number |
+| `MIN_INTERVAL` | 2 | Minimum auto-poll interval in seconds |
+| `MAX_INTERVAL` | 60 | Maximum auto-poll interval in seconds |
+| `MEAS_MIN_GAP` | 2 | Minimum seconds between manual measurements (rate limiting) |
+| `MAX_RETRIES` | 3 | Number of read attempts before giving up |
+| `RETRY_DELAY_MS` | 100 | Delay in milliseconds between read retries |
+| `BIT_THRESHOLD` | 40000 | Nanosecond threshold to distinguish 0 (~26 µs) from 1 (~70 µs) pulses |
+| `PULSE_TIMEOUT_NS` | 200000 | Maximum nanoseconds to wait for a single pulse (200 µs) |
+| `MAX_TIMINGS` | 100 | Maximum number of pulse transitions to capture in one read cycle |
+
+---
+
+## Debug Mode
+
+Enable debug logging to see detailed driver activity in `dmesg`:
+
+```bash
+echo 1 | sudo tee /proc/sensors/dht/debug
 ```
-Byte 0: Humidity high byte
-Byte 1: Humidity low byte
-Byte 2: Temperature high byte (MSB = sign bit)
-Byte 3: Temperature low byte
-Byte 4: Checksum
+
+Example debug output:
+
+```
+[DHT]: debug enabled
+[dht_gpio_23]: poll thread started
+[dht_gpio_23]: read attempt 1 failed - j=38, data=[72,0,23,1,96]
+[dht_gpio_23]: registered successfully
+[dht_gpio_23]: auto-poll enabled (interval=5)
+[dht_gpio_23]: poll thread stopped
+[DHT]: debug disabled
 ```
 
-### Nanosecond Precision Timing
+Debug messages include:
+- GPIO descriptor resolution stages (cache hit, direct lookup, full scan)
+- Read attempt details (attempt number, bit count, raw data bytes)
+- Poll thread start/stop events
+- Rate limiting decisions (manual and auto-poll)
+- Procfs directory creation and ownership tracking
 
-The driver uses `ktime_get_ns()` for nanosecond-precision pulse measurement instead of a counter-based approach. This ensures reliable reads across all Raspberry Pi models regardless of CPU clock speed:
+---
 
-- **Bit threshold**: 40 µs — cleanly separates bit 0 (~26 µs) from bit 1 (~70 µs)
-- **Pulse timeout**: 200 µs — prevents infinite loops if the sensor disconnects
-- **No dependency on CPU frequency or loop overhead**
+## Architecture
 
-### GPIO Chip Detection
+### GPIO Chip Detection — Three-Stage Lookup
 
-On Raspberry Pi 3/4, GPIO pins are directly accessible at global numbers matching the BCM pin number (base = 0). On Raspberry Pi 5, the `pinctrl-rp1` chip has a non-zero base offset, so the driver performs a scan of up to 2048 global GPIO numbers to find the chip.
+The driver resolves BCM pin numbers to GPIO descriptors using a three-stage strategy:
 
-After the first successful detection, the chip base is cached (`cached_chip_base`). Subsequent sensor registrations use the cached value for instant lookup — no scanning required.
+1. **Fast path (cache hit):** If `cached_chip_base` is known (set on first successful lookup), compute `global = base + bcm_pin` and call `gpio_to_desc()` directly. This is the common case after the first sensor is registered.
 
-The driver recognizes Pi GPIO chips by label:
-- `rp1` (Pi 5)
-- `bcm2835` (Pi 3)
-- `bcm2711` (Pi 4)
-- `bcm2712` (Pi 5 alternate)
+2. **Direct lookup:** Try `gpio_to_desc(bcm_pin)` — works on Pi 3/4 where the GPIO chip base is 0 and BCM numbers equal global GPIO numbers. If the descriptor belongs to a known Pi GPIO chip, cache its base.
 
-### Polling Architecture
+3. **Full scan:** Iterate over all global GPIO numbers (0–2048) looking for a Pi GPIO chip where the local offset `(global - chip->base)` matches the requested BCM pin. Needed on Pi 5 where the base offset is large (≥ 512). On success, cache the chip base for future fast-path lookups.
 
-Each sensor with active auto-polling runs in its own kernel thread (`dht_poll_<pin>`). The thread:
-
-1. Performs a measurement via `dht_do_measurement()`
-2. Determines the effective interval (global or per-sensor)
-3. Sleeps for the interval duration (in 1-second increments for responsive shutdown)
-4. Repeats until `kthread_should_stop()` is set
-
-Global auto-poll (`auto_interval`) overrides per-sensor intervals. When global auto-poll is active, all registered sensors poll at the global interval regardless of their individual settings.
-
-### Locking Strategy
-
-- **`list_lock`** — protects the global sensor list and `sensor_count`
-- **`sensor->lock`** — protects per-sensor state (readings, status, interval)
-- **`dht_do_measurement()`** manages `sensor->lock` internally: locks for rate-limit check and result storage, but performs the actual GPIO read without the lock to avoid deadlocks
-- **`READ_ONCE` / `WRITE_ONCE`** used for `global_auto_interval`, `dht_debug`, and `cached_chip_base` — these are write-once or rarely-changed values accessed from multiple threads
+Chip identification uses `is_pi_gpio_chip()` which checks the chip label for known Pi controller names: `pinctrl-rp1`, `pinctrl-bcm2835`, `pinctrl-bcm2711`, `pinctrl-bcm2712`.
 
 ### Rate Limiting
 
-Manual measurements enforce a minimum 2-second gap (`MEAS_MIN_GAP`) between attempts. This prevents sensor overload — DHT sensors require at least 1–2 seconds between reads.
+All measurements (manual and auto-poll) are subject to rate limiting with a minimum gap of `MEAS_MIN_GAP` (2) seconds since the last attempt:
 
-Auto-poll measurements are not rate-limited (the interval itself serves as the limiter).
+- **Manual measurements:** If the gap is too short, the measurement is rejected with `ERR_TOO_SOON` (code 5). The user sees the error in `status_code` and `status_text`.
+- **Auto-poll measurements:** If the gap is too short, the measurement is silently skipped. The last cached data is preserved and returned to the user.
 
-### Retry Logic
+This protects DHT sensors from being polled too frequently, which causes unreliable readings and sensor heating.
 
-Each measurement attempt tries up to 3 times (`MAX_RETRIES`) with a 100 ms delay between retries. DHT sensors frequently fail to respond on the first attempt, especially immediately after module load or after a long idle period.
+### Safe Module Unload — Two-Phase Teardown
 
-### Auto-Detection of Sensor Type
+The driver uses a two-phase teardown sequence to prevent race conditions during module unload:
 
-The driver distinguishes DHT11 from DHT22/AM2302 by examining the raw humidity value:
+**Phase 1 — Block new access and remove procfs:**
+1. Set `dht_exiting` atomic flag — all new `dht_proc_open()` calls return `-ENODEV`
+2. Disable global auto-poll (`global_auto_interval = -1`)
+3. `proc_remove(proc_dir)` removes the entire `/proc/sensors/dht/` subtree. This call blocks until all currently open procfs files are closed (their release handlers call `module_put`, decrementing the module reference count)
 
-- If `humidity_raw > 1000` → **DHT11** (8-bit format: `data[0]` is the integer part, `data[1]` is decimal, always 0)
-- Otherwise → **DHT22/AM2302** (16-bit format: `data[0] << 8 + data[1]` is the full value with 0.1 resolution)
+**Phase 2 — Stop threads and free memory:**
+4. Splice the sensor list under `list_lock` (no new sensors can appear — procfs is gone)
+5. For each sensor: `kthread_stop()` (waits for thread to exit), `mutex_destroy()`, `kfree()`
 
-This works because DHT11's maximum humidity is 90% (raw byte = 90, 16-bit value = 90), while DHT22's raw 16-bit value for typical room humidity (45.2%) would be 452 — well below 1000. The threshold of 1000 cleanly separates the two formats.
+The key insight: after Phase 1, no new file operations can start because all procfs entries are removed. The module reference count (incremented by `try_module_get()` in every `dht_proc_open()`) prevents `rmmod` from proceeding until all open files are closed.
 
-### Procfs Compatibility
+### Shared `/proc/sensors` — Coexistence with Other Drivers
 
-The driver supports both old (`file_operations`) and new (`proc_ops`) procfs APIs via compile-time macros, and handles the `PDE_DATA` → `pde_data` rename in kernel 5.17+.
+The driver is designed to share the `/proc/sensors` parent directory with other sensor drivers:
+
+**On load (`dht_driver_init`):**
+1. Attempt `proc_mkdir("sensors", NULL)` — if it succeeds, the DHT driver created the directory and sets `we_created_parent = true`
+2. If it returns `NULL`, the directory already exists (another driver created it). The DHT driver creates its subdirectory via the full path: `proc_mkdir("sensors/dht", NULL)` — the kernel resolves the existing parent automatically
+
+**On unload (`dht_driver_exit`):**
+1. Remove only the DHT subtree: `proc_remove(proc_dir)` — removes `/proc/sensors/dht/` and all sensor subdirectories
+2. If `we_created_parent` is `true`, check whether `/proc/sensors` is now empty using a VFS directory iteration (`filp_open` + `iterate_dir`)
+3. If empty → remove `/proc/sensors`. If other drivers' subdirectories remain → leave it and log: `"/proc/sensors not removed (other drivers using it)"`
+4. If `we_created_parent` is `false` — the DHT driver never owned `/proc/sensors`, so it does not touch it
+
+This ensures multiple sensor drivers can coexist without one driver accidentally deleting another's procfs entries.
+
+### DHT Protocol Implementation
+
+The driver implements the single-wire DHT communication protocol:
+
+1. **Start signal:** Pull the data line low for 20 ms, then release (switch to input mode)
+2. **Sensor response:** Wait 40 µs for the sensor to pull the line low, then high
+3. **Data reading:** Read 40 data bits by measuring high-pulse widths using `ktime_get_ns()`:
+   - ~26 µs high pulse = bit `0`
+   - ~70 µs high pulse = bit `1`
+   - Threshold: `BIT_THRESHOLD` = 40,000 ns (40 µs)
+4. **Checksum validation:** 5th byte must equal `(byte1 + byte2 + byte3 + byte4) & 0xFF`
+5. **Type detection:** If the combined 16-bit humidity value > 1000, the sensor is a DHT11 (integer format). Otherwise it is a DHT22/AM2302 (decimal format, already scaled ×10).
+6. **Retry:** Up to 3 attempts with 100 ms delay between retries
+
+### Poll Thread Architecture
+
+Each polled sensor runs a dedicated kernel thread (`dht_poll_<pin>`). The thread:
+- Calls `dht_do_measurement()` once per interval
+- Sleeps in 1-second increments to respond quickly to `kthread_should_stop()`
+- Uses the global interval if active, otherwise falls back to the per-sensor interval
+- Respects rate limiting (silently skips if too soon since last measurement)
 
 ---
 
-## Limitations and Notes
+## Version History
 
-- **No device tree overlay needed** — the driver uses GPIO descriptors directly, no DT binding required.
-- **Single-wire protocol is timing-sensitive** — reads may occasionally fail, especially under heavy CPU load. The retry mechanism mitigates this.
-- **Not suitable for Precise real-time applications** — the driver uses standard kernel GPIO API, not raw register access. For mission-critical applications, consider a userspace library with direct register access.
-- **Maximum 32 sensors** — the driver supports up to 32 simultaneously registered sensors (`MAX_SENSORS`).
-- **Pull-up resistor** — DHT11 modules usually include an onboard pull-up. For bare sensors, a 4.7 kΩ – 10 kΩ pull-up resistor between DATA and VCC is required.
-- **No IRQ-based reading** — polling only. The DHT protocol's tight timing requirements make interrupt-based reading impractical without hardware timer support.
-- **Temperature unit** — all values are in Celsius.
-- **No sysfs or char device** — procfs is the only interface.
-- **Kernel 5.x+ required** — the driver uses `ktime_get_ns()`, `gpiod_*` API, and `proc_ops`.
+### v2.6 — Shared `/proc/sensors`
+
+- **Problem:** The driver unconditionally created `/proc/sensors` on load and destroyed it (including other drivers' entries) via `remove_proc_subtree` if it already existed. On unload, it unconditionally removed the parent directory.
+- **Solution:**
+  - Ownership flag `we_created_parent` tracks whether the DHT driver created `/proc/sensors`
+  - If the directory already exists, the driver creates its subdirectory via the full path `proc_mkdir("sensors/dht", NULL)`
+  - On unload, the driver removes only `/proc/sensors/dht/`, then checks `/proc/sensors` for emptiness via VFS `iterate_dir` before removing it
+  - `remove_proc_subtree` is no longer used
+- Multiple sensor drivers can now coexist under `/proc/sensors/` without conflict
+
+### v2.5.2 — Safe Module Unload
+
+- Added `try_module_get()` / `module_put()` on all procfs open/release handlers
+- Added `atomic_t dht_exiting` flag to reject new procfs operations during unload
+- Two-phase teardown: remove procfs first (blocking until files close), then free sensor memory
+- `rmmod` now blocks with `EBUSY` while any procfs file is open
+
+### v2.5.1 — Rate Limiting
+
+- Rate limiting (`MEAS_MIN_GAP` = 2 s) applies to **all** measurements, not just manual
+- Auto-poll measurements that are too soon since the last attempt are silently skipped (last data preserved)
+- Manual measurements that are too soon return `ERR_TOO_SOON`
+
+### v2.5 — Initial Release
+
+- Nanosecond-precision pulse timing via `ktime_get_ns()`
+- 3 retry attempts with 100 ms delay
+- GPIO chip base caching for fast multi-sensor registration on Pi 3/4/5
+- Three-stage GPIO lookup (cache → direct → full scan)
+- Per-sensor mutex for thread-safe data access
+- Background polling threads with per-sensor and global intervals
+- Procfs interface with export/unexport, per-sensor entries, and global configuration
+- Auto-detection of sensor type (DHT11 vs DHT22/AM2302)
+- 20 ms start signal (increased reliability)
+- Kernel API compatibility macros for `struct proc_ops` (5.6+) and `pde_data()` (5.17+)
+
+---
+
+## Known Limitations
+
+1. **Maximum 32 sensors** — The driver supports up to `MAX_SENSORS` (32) simultaneously registered sensors. This limit is compile-time configurable.
+
+2. **BCM pins 0–27 only** — Only the 28 GPIO pins exposed on the Raspberry Pi 40-pin header are supported. Pins with special functions (e.g., GPIO0/1 for I2C) can be used but may conflict with other drivers.
+
+3. **Minimum 2 seconds between reads** — DHT sensors require at least 2 seconds between measurements. The driver enforces this via rate limiting for both manual and auto-poll measurements.
+
+4. **Single-wire protocol timing sensitivity** — The DHT protocol relies on precise microsecond timing. Under heavy CPU load, readings may fail. The driver retries up to 3 times and caches the last successful result.
+
+5. **No hardware interrupts** — The driver uses busy-loop polling with `ktime_get_ns()` for pulse measurement. It does not use GPIO interrupts, which would require a different approach.
+
+6. **No device tree binding** — Sensors are registered dynamically via procfs, not through device tree. This allows runtime flexibility but requires manual configuration.
 
 ---
 
 ## Troubleshooting
 
-### Sensor registration fails with "Input/output error"
+### Sensor registration fails with "GPIO request/lookup failed"
 
-1. Check wiring: VCC (3.3V), GND, DATA pin
-2. Verify the pull-up resistor (4.7–10 kΩ) is present if using a bare sensor
-3. Enable debug and check dmesg:
+```
+[dht_gpio_23]: GPIO descriptor not found
+[dht_gpio_23]: registration failed - GPIO request/lookup failed
+```
+
+**Causes and solutions:**
+- The GPIO pin is already in use by another driver (e.g., I2C, SPI). Check with `sudo cat /sys/kernel/debug/gpio`.
+- The pin number is invalid. Valid range is 0–27.
+- The kernel does not expose the GPIO chip. Ensure the `pinctrl-bcm2835` (or `pinctrl-rp1` for Pi 5) driver is loaded.
+
+### Read fails with "Sensor data read failed"
+
+```
+[dht_gpio_23]: read failed after 3 attempts - j=38, data=[72,0,23,1,96]
+```
+
+**Causes and solutions:**
+- **Missing or wrong pull-up resistor** — Ensure a 4.7 kΩ – 10 kΩ resistor is between DATA and VCC.
+- **Wire too long** — Keep the data wire under 20 cm for reliable readings. For longer runs, use a shielded cable.
+- **Sensor powered from 5 V with 3.3 V GPIO** — Use a level shifter or power the sensor from 3.3 V.
+- **CPU overload** — Reduce system load or increase the poll interval. The driver retries 3 times automatically.
+- **Sensor defective** — Try a different sensor.
+
+### `rmmod` fails with "Module dht is in use"
+
+```bash
+sudo rmmod dht
+# ERROR: Module dht is in use
+```
+
+A procfs file is still open. Close all files under `/proc/sensors/dht/` and try again. This is by design — the module reference counting prevents unsafe unloads.
+
+### `cat /proc/sensors/dht/gpio23/value` shows stale data
+
+If auto-poll is disabled and the last manual measurement failed, the `value` entry shows the last successful reading (or "No measurement taken" if no measurement has succeeded). Trigger a new measurement:
+
+```bash
+echo 1 | sudo tee /proc/sensors/dht/gpio23/measure
+```
+
+### `/proc/sensors` not removed after unload
+
+```
+[DHT]: /proc/sensors not removed (other drivers using it)
+```
+
+This is expected behavior when another sensor driver has subdirectories under `/proc/sensors/`. The DHT driver only removes `/proc/sensors` if it created the directory and no other subdirectories remain.
+
+### Enable debug for detailed diagnostics
 
 ```bash
 echo 1 | sudo tee /proc/sensors/dht/debug
-echo 23 | sudo tee /proc/sensors/dht/export
-dmesg | tail -20
+dmesg | grep -E "\[DHT\]|\[dht_gpio"
 ```
-
-4. Look for `read failed` messages with `data=[...]` — if `j < 40`, bits are being lost. Ensure the sensor is a genuine DHT11/DHT22, not a counterfeit.
-5. If `j=0`, the sensor is not responding at all — check power and wiring.
-
-### "GPIO descriptor not found"
-
-The driver could not find a Pi GPIO chip. This may happen on non-Raspberry Pi boards. The driver only supports Raspberry Pi GPIO controllers (`pinctrl-bcm2835`, `pinctrl-bcm2711`, `pinctrl-rp1`).
-
-### Readings are always the same
-
-DHT11 has a 1-second minimum sampling rate. If you read too frequently, the sensor returns cached data. Ensure your poll interval is ≥ 2 seconds.
-
-### Negative temperature reads as positive
-
-If using a DHT22 in sub-zero conditions, ensure the sensor supports negative temperatures. DHT11 does not measure below 0 °C.
-
-### "Too soon since last measurement"
-
-Manual measurements are rate-limited to one every 2 seconds. Wait and try again, or use auto-polling instead.
-
-### dmesg shows no output at all
-
-The driver only prints to dmesg for registration/unregistration events and errors. Measurement results are only logged when debug mode is enabled:
-
-```bash
-echo 1 | sudo tee /proc/sensors/dht/debug
-```
-
-### Module fails to compile
-
-Ensure you have the correct kernel headers installed:
-
-```bash
-sudo apt install linux-headers-$(uname -r)
-```
-
-The driver requires kernel 5.x or newer for `proc_ops` and `gpiod_*` API support.
 
 ---
 
-## File Structure
+## Files in This Release
 
-```
-dht_driver/
-├── dht.c          # Driver source code
-├── Makefile       # Build configuration
-└── README.md      # This file
+| File | Description |
+|------|-------------|
+| `dht.c` | Driver source code (single-file kernel module) |
+| `Makefile` | Build configuration for `make` |
+| `README.md` | Readme file (English) |
+| `README_RU.md` | Readme file (Russian) |
+| `changelog.txt` | Detailed changelog (English) |
+| `changelog_ru.txt` | Detailed changelog (Russian) |
+
+---
+
+## Build Requirements
+
+### Kernel Version
+
+The driver is compatible with Linux kernel **5.x** and later, including **6.18+**. Compatibility macros handle API changes:
+
+| Kernel Version | API Change | Driver Handling |
+|----------------|------------|-----------------|
+| 5.6+ | `struct proc_ops` replaces `struct file_operations` for procfs | Compile-time macro `DHT_PROC_OPS` |
+| 5.17+ | `PDE_DATA()` renamed to `pde_data()` | Compile-time macro `DHT_PDE_DATA()` |
+| 6.x+ | `dir_context.actor` returns `bool` instead of `int` | `dht_dir_filldir` returns `bool` |
+
+### Tested Configurations
+
+| Hardware | Kernel | Result |
+|----------|--------|--------|
+| Raspberry Pi 5 | 6.18.50+ (rpt-rpi-2712) | Compiles and runs |
+| Raspberry Pi 4 | 6.1.x (rpt-rpi-2711) | Compiles and runs |
+| Raspberry Pi 3 | 5.15.x (rpt-rpi-bcm2835) | Compiles and runs |
+
+### Build Dependencies
+
+```bash
+sudo apt install linux-headers-$(uname -r) build-essential
 ```
 
 ---
 
 ## License
 
-This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License version 3 as published by the Free Software Foundation.
+This program is free software; you can redistribute it and/or modify it under the terms of the **GNU General Public License version 3** as published by the Free Software Foundation.
+
+```
+DHT Driver © 2026, Chapvic
+Licensed under GPL v3
+```
+
+---
+
+## Acknowledgements
+
+**Author:** Chapvic
+
+**Tested on:**
+
+| Hardware | Sensors Used |
+|----------|-------------|
+| Raspberry Pi 5 (8 GB) | DHT22, AM2302 |
+| Raspberry Pi 4 (4 GB) | DHT11, DHT22 |
+| Raspberry Pi 3 (1 GB) | DHT11 |
+
+**GPIO testing equipment:** Logic analyzer for protocol verification, oscilloscope for signal integrity checks.

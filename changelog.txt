@@ -1,0 +1,325 @@
+================================================================================
+                      DHT Driver - Changelog
+                      Release Version 2.6
+                      Copyright (c) 2026, Chapvic
+================================================================================
+
+Release Date: 2026-09-20
+License: GPL v3
+Supported Sensors: DHT11, DHT22, AM2302
+Supported Boards:  Raspberry Pi 1/2/3/Zero, Raspberry Pi 4, Raspberry Pi 5
+Tested Kernel:     6.18.50 (Raspberry Pi OS, arm64)
+
+
+================================================================================
+RELEASE HIGHLIGHTS
+================================================================================
+
+Version 2.6 introduces shared /proc/sensors directory support, allowing the DHT
+driver to coexist with other sensor drivers that use the same parent directory.
+Previously, the driver would destroy other drivers' entries on init and remove
+the shared directory on exit unconditionally.
+
+This release also includes all fixes and improvements from the 2.5.x series:
+rate limiting for all measurements and safe module unloading with reference
+counting.
+
+
+================================================================================
+VERSION HISTORY
+================================================================================
+
+v2.6 (2026-09-20) - Shared /proc/sensors directory
+--------------------------------------------------------------------------------
+
+NEW FEATURE: Shared /proc/sensors directory
+  The driver now safely coexists with other sensor drivers that place their
+  proc entries under /proc/sensors/. The previous version had two critical
+  problems:
+
+  Problem 1 - Init: destroy on conflict
+    If /proc/sensors already existed (created by another driver), the init
+    function called remove_proc_subtree("sensors", NULL) to destroy it, then
+    recreated an empty /proc/sensors. This wiped out all entries belonging to
+    other drivers.
+
+  Problem 2 - Exit: unconditional removal
+    The exit function called proc_remove(proc_parent) unconditionally,
+    destroying /proc/sensors even if other drivers had entries there.
+
+  Solution - Three mechanisms:
+
+  1. Ownership flag (we_created_parent)
+     A new global boolean variable tracks whether the DHT driver created
+     /proc/sensors. It is set to true only when proc_mkdir("sensors", NULL)
+     returns a valid handle (directory did not exist before).
+
+  2. Smart init
+     - proc_mkdir("sensors", NULL) succeeds → we own it, create "dht" as
+       a child via proc_mkdir("dht", proc_parent).
+     - proc_mkdir("sensors", NULL) returns NULL → directory exists, we do NOT
+       own it. Create "dht" via full path: proc_mkdir("sensors/dht", NULL).
+       The kernel's xlate_proc_name() resolves the existing parent.
+     - remove_proc_subtree() call completely removed from init.
+
+  3. Smart exit
+     - proc_remove(proc_dir) removes only /proc/sensors/dht/ and everything
+       beneath it.
+     - If we_created_parent is true AND /proc/sensors is now empty (checked
+       via VFS), proc_remove(proc_parent) removes it.
+     - If /proc/sensors still contains other drivers' subdirectories, it is
+       left intact with a log message:
+         "[DHT]: /proc/sensors not removed (other drivers using it)"
+     - If we_created_parent is false, /proc/sensors is never touched.
+
+  VFS directory emptiness check (dht_proc_dir_is_empty):
+    struct proc_dir_entry is opaque in modern kernels (5.x+), so the ->subdir
+    linked list cannot be inspected directly. The function uses the standard
+    VFS interface:
+      - filp_open(path, O_RDONLY | O_DIRECTORY)
+      - iterate_dir() with a custom callback (dht_dir_filldir)
+      - filp_close()
+
+    The callback (dht_dir_filldir) returns bool (required by kernel 6.x):
+      - true:  continue iteration (entry was "." or "..")
+      - false: stop iteration (found a real entry)
+
+    Conservative behavior: if the directory cannot be opened or read, the
+    function returns false ("not empty"), preventing accidental removal.
+
+  Coexistence scenarios:
+
+    +---------------------+---------------------+--------------------------------+
+    | Who loads first     | we_created_parent   | DHT unload behavior            |
+    +---------------------+---------------------+--------------------------------+
+    | DHT                 | true                | Remove /proc/sensors/dht,      |
+    |                     |                     | check if /proc/sensors empty,  |
+    |                     |                     | remove if empty                |
+    +---------------------+---------------------+--------------------------------+
+    | Other driver        | false               | Remove only /proc/sensors/dht, |
+    |                     |                     | leave /proc/sensors untouched  |
+    +---------------------+---------------------+--------------------------------+
+
+  Files changed:
+    - dht.c: dht_driver_init() - rewritten init logic
+    - dht.c: dht_driver_exit() - rewritten exit logic
+    - dht.c: new struct dht_dir_ctx
+    - dht.c: new function dht_dir_filldir()
+    - dht.c: new function dht_proc_dir_is_empty()
+    - dht.c: new global variable we_created_parent
+    - dht.c: updated comment on proc_parent
+    - dht.c: updated feature list in file header
+    - dht.c: DHT_DRIVER_VERSION "2.5.3" -> "2.6"
+    - dht.c: Version comment "2.5" -> "2.6"
+
+
+v2.5.2 - Safe module unloading
+--------------------------------------------------------------------------------
+
+BUG FIX: Race condition during module unload
+
+  Root cause:
+    proc_ops entries did not set .owner field, so the kernel did not hold a
+    reference to the module while procfs files were open. Additionally, the
+    poll thread (kthread) could still be running when kfree() was called on
+    sensor structures.
+
+  Three-layer protection:
+
+  Layer 1 - Module reference counting (primary)
+    Generic open/release handlers are wired to ALL 13 procfs entries (4 global
+    + 9 per-sensor):
+      - dht_proc_open():  checks dht_exiting flag, calls try_module_get(THIS_MODULE)
+      - dht_proc_release(): calls module_put(THIS_MODULE)
+    While any procfs file is open, rmmod receives EBUSY.
+
+  Layer 2 - atomic_t dht_exiting (additional barrier)
+    Set to 1 in the first line of dht_driver_exit(). dht_proc_open() checks it
+    and returns -ENODEV, preventing new file operations from starting.
+
+  Layer 3 - Two-phase cleanup
+    Phase 1: Set dht_exiting → disable global auto-poll → proc_remove(proc_dir).
+             After this, no new file operations can reach the sensors.
+    Phase 2: list_splice_init under lock → for each sensor: dht_stop_poll →
+             mutex_destroy → kfree.
+
+  dht_driver_exit() does NOT call dht_sensor_free() — it performs its own
+  cleanup that removes procfs entries before stopping threads.
+
+
+v2.5.1 - Rate limiting for all measurements
+--------------------------------------------------------------------------------
+
+BUG FIX: Rate limiting only applied to manual measurements
+
+  Root cause:
+    The MEAS_MIN_GAP check was wrapped in "if (manual)" — auto-poll
+    measurements bypassed rate limiting entirely, allowing back-to-back
+    reads that violate the DHT sensor's 2-second minimum interval.
+
+  Fix:
+    MEAS_MIN_GAP check moved outside the "if (manual)" block. Now:
+      - Manual measurement: returns ERR_TOO_SOON to the user
+      - Auto-poll: silently skips with a debug message, last valid data
+        is preserved
+
+
+v2.5 - Initial release
+--------------------------------------------------------------------------------
+
+  Core features:
+    - Nanosecond-precision pulse timing (ktime_get_ns) for reliable reads
+    - Three-stage GPIO descriptor lookup with chip base caching:
+        1. Fast path: cached_chip_base + bcm_pin
+        2. Direct lookup: gpio_to_desc(bcm_pin) (Pi 3/4, base=0)
+        3. Full scan: 0..2048, find Pi chip with matching local offset (Pi 5)
+    - Automatic sensor type detection (DHT11 vs DHT22/AM2302)
+    - Per-sensor and global auto-poll with configurable interval (2-60 s)
+    - procfs interface under /proc/sensors/dht/
+    - Up to 32 simultaneous sensors
+    - 3 retry attempts with 100 ms delay between reads
+    - 20 ms start signal, 40 us response wait
+    - Bit threshold: 40 us (0 = ~26 us, 1 = ~70 us)
+    - Pulse timeout: 200 us
+    - Temperature range: negative values supported (DHT22/AM2302)
+    - Kernel API compatibility macros (proc_ops, pde_data)
+
+
+================================================================================
+COMPLETE CHANGELOG: v2.5 → v2.6
+================================================================================
+
+Changes grouped by category:
+
+[1] Shared /proc/sensors directory (v2.6)
+    - NEW: we_created_parent global flag
+    - NEW: dht_dir_filldir() VFS callback (returns bool)
+    - NEW: dht_proc_dir_is_empty() function
+    - NEW: struct dht_dir_ctx
+    - CHANGED: dht_driver_init() — smart creation, no remove_proc_subtree
+    - CHANGED: dht_driver_exit() — conditional removal with emptiness check
+    - CHANGED: proc_parent comment updated
+    - CHANGED: Feature list updated in file header
+
+[2] Safe module unloading (v2.5.2)
+    - NEW: dht_proc_open() generic open handler (try_module_get)
+    - NEW: dht_proc_release() generic release handler (module_put)
+    - NEW: atomic_t dht_exiting flag
+    - CHANGED: All 13 procfs entries wired with DHT_PROC_OPEN/DHT_PROC_RELEASE
+    - CHANGED: dht_driver_exit() — two-phase cleanup
+    - CHANGED: dht_sensor_free() — no longer called from exit, used only by
+              export_write and unexport_write
+
+[3] Rate limiting (v2.5.1)
+    - CHANGED: dht_do_measurement() — MEAS_MIN_GAP check outside "if (manual)"
+    - CHANGED: Auto-poll measurements skip silently instead of forcing reads
+
+[4] Version metadata
+    - DHT_DRIVER_VERSION: "2.5" → "2.6"
+    - Version comment in file header: "2.5" → "2.6"
+    - Feature list: added "Safe module unload with module reference counting"
+    - Feature list: added "Shared /proc/sensors: coexists with other drivers"
+
+
+================================================================================
+PROCFS INTERFACE
+================================================================================
+
+Global entries (/proc/sensors/dht/):
+
+  Entry          Mode   Description
+  ─────────────  ─────  ─────────────────────────────────────────────
+  debug          rw     Debug logging: 0 = off (default), 1 = on
+  version        r      Driver version string
+  export         w      Write BCM pin number to register a new sensor
+  unexport       w      Write BCM pin number to unregister a sensor
+  auto_interval  rw     Global auto-poll interval (2-60, -1 = off)
+
+Per-sensor entries (/proc/sensors/dht/gpio<pin>/):
+
+  Entry          Mode   Description
+  ─────────────  ─────  ─────────────────────────────────────────────
+  pin            r      BCM GPIO pin number
+  interval       rw     Auto-poll interval in seconds (2-60, -1 = off)
+  measure        w      Write "1" to trigger manual measurement
+  status_code    r      Error code (0 = success)
+  status_text    r      Error description string
+  value          r      "H=<humidity>\nT=<temperature>\n"
+  info           r      Sensor type + registration time (ISO 8601)
+  timestamp      r      Unix timestamp of last measurement
+
+
+================================================================================
+ERROR CODES
+================================================================================
+
+  Code  Constant           Description
+  ────  ─────────────────  ─────────────────────────────────────────
+  0     ERR_SUCCESS        Operation completed successfully
+  1     ERR_PIN_INVALID    GPIO pin number out of range (0-27)
+  2     ERR_GPIO_REQUEST   GPIO descriptor request/lookup failed
+  3     ERR_READ_FAILED    Sensor read failed (checksum, timeout)
+  4     ERR_AUTO_MODE      Manual measurement while auto-poll active
+  5     ERR_TOO_SOON       Rate limited (minimum 2s between measurements)
+
+
+================================================================================
+COMPATIBILITY
+================================================================================
+
+Kernel versions:
+  - Tested on 6.18.50 (Raspberry Pi OS, arm64)
+  - Compatible with kernel 5.6+ (proc_ops API)
+  - Compatible with kernel 5.17+ (pde_data() API)
+  - Backward compatible with kernel < 5.6 (file_operations API)
+  - Backward compatible with kernel < 5.17 (PDE_DATA() macro)
+
+Hardware:
+  - Raspberry Pi 1/2/3/Zero (pinctrl-bcm2835, GPIO base = 0)
+  - Raspberry Pi 4 (pinctrl-bcm2711, GPIO base = 0)
+  - Raspberry Pi 5 (pinctrl-rp1, GPIO base >= 512)
+
+API compatibility:
+  - No changes to procfs interface or user-facing behavior
+  - Fully backward compatible with v2.5 user-space tools
+  - Other sensor drivers can use /proc/sensors/ without conflict
+
+
+================================================================================
+KNOWN LIMITATIONS
+================================================================================
+
+  - Maximum 32 simultaneously registered sensors
+  - BCM GPIO pins 0-27 only (Raspberry Pi 40-pin header)
+  - Minimum 2 seconds between measurements (DHT hardware constraint)
+  - Single-wire protocol is timing-sensitive; high system load may cause
+    read failures (mitigated by 3 retry attempts)
+  - Auto-poll threads sleep in 1-second increments (max ~1s latency for
+    kthread_should_stop response)
+
+
+================================================================================
+FILES IN THIS RELEASE
+================================================================================
+
+  File                Description
+  ──────────────────  ─────────────────────────────────────────────
+  dht.c               Driver source code (single file, ~1900 lines)
+  Makefile            Kernel module build file
+  changelog.txt       This file
+
+
+================================================================================
+ACKNOWLEDGEMENTS
+================================================================================
+
+  Tested on:
+    - Raspberry Pi 5 (8 GB) with DHT22 sensor on GPIO23
+    - Kernel 6.18.50+rpt-rpi-2712 (Raspberry Pi OS, arm64)
+
+  Sensor types verified:
+    - DHT11  (integer humidity/temperature)
+    - DHT22  (decimal humidity/temperature)
+    - AM2302 (DHT22 in enclosed form factor)
+
+================================================================================

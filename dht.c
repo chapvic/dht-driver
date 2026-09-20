@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2026, Chapvic
  *
- * Version: 2.5
+ * Version: 2.6
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -23,6 +23,7 @@
  *   - Nanosecond-precision pulse timing for reliable reads across all Pi models
  *   - Rate limiting for all measurements (manual and auto-poll)
  *   - Safe module unload with module reference counting
+ *   - Shared /proc/sensors: coexists with other sensor drivers
  *
  *
  *  /proc/sensors/dht/
@@ -69,7 +70,7 @@
 /* Driver metadata constants used in MODULE_* macros and dmesg output */
 #define DHT_DRIVER_AUTHOR        "DHT Driver © 2026, Chapvic"
 #define DHT_DRIVER_DESCRIPTION   "DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver"
-#define DHT_DRIVER_VERSION       "2.5.2"
+#define DHT_DRIVER_VERSION       "2.6"
 #define DHT_DRIVER_LICENSE       "GPL"
 
 MODULE_LICENSE(DHT_DRIVER_LICENSE);
@@ -225,8 +226,9 @@ struct dht_sensor {
  * sensor registration, then only read (using READ_ONCE) to avoid
  * repeated GPIO chip scanning on subsequent registrations.
  */
-static struct proc_dir_entry *proc_parent;   /* /proc/sensors directory handle */
+static struct proc_dir_entry *proc_parent;   /* /proc/sensors directory handle (NULL if not owned by us) */
 static struct proc_dir_entry *proc_dir;      /* /proc/sensors/dht directory handle */
+static bool we_created_parent = false;       /* True if WE created /proc/sensors (and should remove it if empty) */
 static LIST_HEAD(sensor_list);               /* Head of the linked list of all registered sensors */
 static DEFINE_MUTEX(list_lock);              /* Mutex protecting sensor_list and sensor_count */
 static int sensor_count = 0;                 /* Current number of registered sensors */
@@ -1628,6 +1630,97 @@ static const DHT_PROC_OPS unexport_fops = {
     DHT_PROC_RELEASE = dht_proc_release,
 };
 
+/* ── Proc directory emptiness check ─────────────────────── */
+
+/*
+ * struct dht_dir_ctx - Context for directory iteration callback
+ * @ctx:   Standard dir_context used by iterate_dir
+ * @count: Counter for real entries found (excluding . and ..)
+ *
+ * Used by dht_proc_dir_is_empty() to check whether a /proc directory
+ * contains any subdirectories other than the standard . and .. entries.
+ */
+struct dht_dir_ctx {
+    struct dir_context ctx;
+    int count;
+};
+
+/**
+ * dht_dir_filldir - Callback for iterate_dir that counts real directory entries
+ * @ctx:     Pointer to the dir_context (embedded in dht_dir_ctx)
+ * @name:    Name of the current directory entry
+ * @namlen:  Length of the name string
+ * @pos:     Position offset (unused)
+ * @ino:     Inode number (unused)
+ * @d_type:  Directory entry type (unused)
+ *
+ * This callback is invoked by iterate_dir for each entry in a directory.
+ * It skips the standard "." and ".." entries and counts all other entries.
+ * Once a real entry is found, it returns false to stop iteration early
+ * (we only need to know if the directory is non-empty, not list everything).
+ *
+ * Returns: true to continue iteration (entry was . or ..), false to stop
+ *          (found a real entry — directory is not empty).
+ */
+static bool dht_dir_filldir(struct dir_context *ctx, const char *name,
+                            int namlen, loff_t pos, u64 ino,
+                            unsigned int d_type)
+{
+    struct dht_dir_ctx *dctx;
+
+    dctx = container_of(ctx, struct dht_dir_ctx, ctx);
+
+    /* Skip "." and ".." — they are not real subdirectories */
+    if (name[0] == '.' && (namlen == 1 || (namlen == 2 && name[1] == '.')))
+        return true;
+
+    /* Found a real entry — increment count and stop iteration */
+    dctx->count++;
+    return false;
+}
+
+/**
+ * dht_proc_dir_is_empty - Check whether a /proc directory is empty
+ * @path: Full path of the directory to check (e.g., "/proc/sensors")
+ *
+ * Opens the directory via VFS and iterates over its entries using
+ * iterate_dir. Returns true if the directory contains no entries
+ * other than "." and "..".
+ *
+ * This function is needed because struct proc_dir_entry is opaque
+ * in newer kernels (5.x+), so we cannot directly inspect the ->subdir
+ * linked list. The VFS approach works universally across kernel versions.
+ *
+ * Returns: true if the directory is empty, false if it contains entries
+ *          or if the directory could not be opened (conservative: treat
+ *          "can't check" as "not empty" to avoid accidental removal).
+ */
+static bool dht_proc_dir_is_empty(const char *path)
+{
+    struct file *filp;
+    struct dht_dir_ctx dctx = {
+        .ctx.actor = dht_dir_filldir,
+        .count = 0,
+    };
+    bool empty;
+
+    filp = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
+    if (IS_ERR(filp)) {
+        /* Could not open — conservatively assume not empty */
+        dht_err("could not open %s for emptiness check\n", path);
+        return false;
+    }
+
+    /* Iterate over directory entries */
+    dctx.ctx.pos = 0;
+    iterate_dir(filp, &dctx.ctx);
+
+    empty = (dctx.count == 0);
+    filp_close(filp, NULL);
+
+    return empty;
+}
+
 /* ── Module init / exit ────────────────────────────────────── */
 
 /* Table of global proc entries created under /proc/sensors/dht/ */
@@ -1667,24 +1760,37 @@ static int __init dht_driver_init(void)
     dht_info("%s (v%s)\n",
              DHT_DRIVER_AUTHOR, DHT_DRIVER_VERSION);
 
-    /* Create the parent /proc/sensors directory.
-     * If it already exists (created by another driver), retry after cleanup. */
+    /*
+     * Create the parent /proc/sensors directory.
+     *
+     * Two cases:
+     *   1. /proc/sensors does not exist yet:
+     *      proc_mkdir("sensors", NULL) succeeds → we own it.
+     *      proc_parent is set, we_created_parent = true.
+     *      Create "dht" as a child: proc_mkdir("dht", proc_parent).
+     *
+     *   2. /proc/sensors already exists (created by another driver):
+     *      proc_mkdir("sensors", NULL) returns NULL.
+     *      We create "dht" via full path: proc_mkdir("sensors/dht", NULL).
+     *      The kernel's xlate_proc_name() resolves the existing parent.
+     *      proc_parent stays NULL — we do NOT own /proc/sensors.
+     *      we_created_parent = false — we will NOT remove it on exit.
+     */
     proc_parent = proc_mkdir(PROC_PARENT, NULL);
-    if (!proc_parent) {
-        /* The directory may already exist — try removing and recreating it */
-        remove_proc_subtree(PROC_PARENT, NULL);
-        proc_parent = proc_mkdir(PROC_PARENT, NULL);
-        if (!proc_parent) {
-            dht_err("failed to create /proc/%s\n", PROC_PARENT);
-            return -ENOMEM;
-        }
+    if (proc_parent) {
+        /* We created /proc/sensors — we own it */
+        we_created_parent = true;
+        proc_dir = proc_mkdir(PROC_DIR_NAME, proc_parent);
+    } else {
+        /* /proc/sensors already exists — use full path to create our subdir */
+        we_created_parent = false;
+        proc_dir = proc_mkdir(PROC_PARENT "/" PROC_DIR_NAME, NULL);
     }
 
-    /* Create the /proc/sensors/dht directory */
-    proc_dir = proc_mkdir(PROC_DIR_NAME, proc_parent);
     if (!proc_dir) {
         dht_err("failed to create /proc/%s/%s\n", PROC_PARENT, PROC_DIR_NAME);
-        proc_remove(proc_parent);
+        if (we_created_parent)
+            proc_remove(proc_parent);
         return -ENOMEM;
     }
 
@@ -1693,9 +1799,10 @@ static int __init dht_driver_init(void)
         const struct proc_entry_def *e = &global_proc_entries[i];
         if (!proc_create(e->name, e->mode, proc_dir, e->fops)) {
             dht_err("failed to create proc entry '%s'\n", e->name);
-            /* Clean up on failure: remove the dht directory and its parent */
+            /* Clean up on failure */
             proc_remove(proc_dir);
-            proc_remove(proc_parent);
+            if (we_created_parent)
+                proc_remove(proc_parent);
             return -ENOMEM;
         }
     }
@@ -1739,13 +1846,26 @@ static void __exit dht_driver_exit(void)
     /* Disable global auto-poll so poll threads won't start new measurements */
     WRITE_ONCE(global_auto_interval, -1);
 
-    /* Remove all procfs entries at once. proc_remove(proc_dir) removes
+    /* Remove our procfs subtree. proc_remove(proc_dir) removes
      * /proc/sensors/dht/ and all subdirectories (gpio<pin>/) and files
      * beneath it. This call blocks until all currently open procfs files
      * are closed (their release handlers call module_put, decrementing
      * the module reference count). */
     proc_remove(proc_dir);
-    proc_remove(proc_parent);
+
+    /* Remove /proc/sensors ONLY if we created it AND it is now empty
+     * (no other drivers left their subdirectories there).
+     * struct proc_dir_entry is opaque in modern kernels, so we use
+     * the VFS iterate_dir approach to check emptiness. */
+    if (we_created_parent && proc_parent) {
+        if (dht_proc_dir_is_empty("/proc/" PROC_PARENT)) {
+            proc_remove(proc_parent);
+            dht_dbg("/proc/%s removed (was empty)\n", PROC_PARENT);
+        } else {
+            dht_info("/proc/%s not removed (other drivers using it)\n",
+                     PROC_PARENT);
+        }
+    }
 
     /* ── Phase 2: Stop threads and free memory ── */
 
