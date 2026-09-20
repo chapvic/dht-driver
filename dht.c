@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2026, Chapvic
  *
- * Version: 2.6
+ * Version: 2.7
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -24,6 +24,7 @@
  *   - Rate limiting for all measurements (manual and auto-poll)
  *   - Safe module unload with module reference counting
  *   - Shared /proc/sensors: coexists with other sensor drivers
+ *   - Configuration file: optional /etc/default/dht for auto-registration at load
  *
  *
  *  /proc/sensors/dht/
@@ -43,6 +44,32 @@
  *    value         (r)  - "H=<humidity>\nT=<temperature>\n"
  *    info          (r)  - sensor type + registration time
  *    timestamp     (r)  - Unix timestamp of last measurement
+ *
+ *
+ *  Configuration file (optional): /etc/default/dht
+ *
+ *  Read at module load time. If the file is missing, the driver loads
+ *  with defaults. Lines starting with '#' and empty lines are ignored.
+ *  Unknown options and invalid values produce warnings in dmesg.
+ *
+ *  Global options:
+ *    DEBUG                - enable debug logging at load (same as DEBUG=1)
+ *    DEBUG=0|1            - explicitly disable/enable debug logging
+ *    AUTO_INTERVAL=n      - global auto-poll interval in seconds (2-60)
+ *                           Starts polling for all registered sensors
+ *
+ *  Sensor registration:
+ *    SENSOR=<pin>         - register a sensor on the given BCM pin
+ *    SENSOR=<pin>,<n>     - register with per-sensor auto-poll interval
+ *                           (2-60 seconds; -1 disables auto-poll)
+ *
+ *  Example:
+ *    # /etc/default/dht
+ *    DEBUG=1
+ *    AUTO_INTERVAL=10
+ *    SENSOR=4             - DHT22 on GPIO4, uses global interval
+ *    SENSOR=17,5          - DHT11 on GPIO17, polls every 5 seconds
+ *    SENSOR=22            - Sensor on GPIO22, no auto-poll
  */
 
 #include <linux/module.h>
@@ -70,7 +97,7 @@
 /* Driver metadata constants used in MODULE_* macros and dmesg output */
 #define DHT_DRIVER_AUTHOR        "DHT Driver © 2026, Chapvic"
 #define DHT_DRIVER_DESCRIPTION   "DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver"
-#define DHT_DRIVER_VERSION       "2.6"
+#define DHT_DRIVER_VERSION       "2.7"
 #define DHT_DRIVER_LICENSE       "GPL"
 
 MODULE_LICENSE(DHT_DRIVER_LICENSE);
@@ -95,6 +122,9 @@ MODULE_VERSION(DHT_DRIVER_VERSION);
 #define RETRY_DELAY_MS   100        /* Delay in milliseconds between read retries */
 #define BIT_THRESHOLD    40000      /* Nanosecond threshold to distinguish 0 (~26 us) from 1 (~70 us) pulses */
 #define PULSE_TIMEOUT_NS 200000     /* Maximum nanoseconds to wait for a single pulse before timing out (200 us) */
+#define CONFIG_PATH      "/etc/default/dht"  /* Path to the optional configuration file read at module load */
+#define CONFIG_BUF_LEN   4096               /* Maximum size of the configuration file buffer */
+#define CONFIG_LINE_LEN  256                /* Maximum length of a single config line */
 
 /* ── Error code definitions ───────────────────────────────── */
 
@@ -902,7 +932,7 @@ static const DHT_PROC_OPS debug_fops = {
  * @count: Maximum number of bytes to write
  * @pos:   File offset — used to return 0 on subsequent reads (EOF)
  *
- * Outputs the driver version (e.g., "2.5\n") to the user buffer.
+ * Outputs the driver version (e.g., "2.7\n") to the user buffer.
  *
  * Returns: Number of bytes written on first call, 0 on subsequent calls.
  */
@@ -1459,23 +1489,18 @@ static int dht_create_sensor_proc(struct dht_sensor *sensor)
  *          -ENOMEM (max sensors or allocation failure),
  *          -ENODEV (GPIO not found), -EIO (measurement failed).
  */
-static ssize_t export_write(struct file *f, const char __user *buf, size_t count, loff_t *pos)
+static int dht_do_register(int pin, int interval)
 {
-    int pin;
     struct dht_sensor *sensor, *s;
     struct gpio_desc *desc;
     struct gpio_chip *chip;
     int ret;
 
-    /* Step 1: Parse the pin number from user input */
-    ret = dht_parse_int(buf, count, &pin);
-    if (ret)
-        return ret;
+    /* Validate pin range */
     if (pin < 0 || pin > MAX_PIN_NUM)
         return -EINVAL;
 
-    /* Step 2: Check for duplicate registration and sensor count limit.
-     * These checks are done under list_lock to prevent race conditions. */
+    /* Check for duplicate registration and sensor count limit */
     mutex_lock(&list_lock);
     list_for_each_entry(s, &sensor_list, list) {
         if (s->pin == pin) {
@@ -1491,9 +1516,7 @@ static ssize_t export_write(struct file *f, const char __user *buf, size_t count
     }
     mutex_unlock(&list_lock);
 
-    /* Step 3: Resolve the GPIO descriptor for this BCM pin.
-     * On first call, this may trigger a full GPIO chip scan.
-     * Subsequent calls use the cached chip base for fast lookup. */
+    /* Resolve the GPIO descriptor for this BCM pin */
     desc = dht_find_desc(pin);
     if (!desc) {
         pin_err(pin, "GPIO descriptor not found\n");
@@ -1508,57 +1531,71 @@ static ssize_t export_write(struct file *f, const char __user *buf, size_t count
     else
         pin_log(pin, "found (global=%d)\n", pin);
 
-    /* Step 4: Allocate and initialize the sensor struct */
+    /* Allocate and initialize the sensor struct */
     sensor = kzalloc(sizeof(*sensor), GFP_KERNEL);
     if (!sensor)
         return -ENOMEM;
 
-    /* Initialize sensor fields with default values */
     sensor->pin = pin;
-    sensor->interval = -1;                              /* Auto-poll disabled by default */
+    sensor->interval = interval;                         /* Use provided interval (-1 = disabled) */
     sensor->status_code = ERR_SUCCESS;
-    sensor->register_time = ktime_get_real_seconds();  /* Record registration timestamp */
-    sensor->sensor_type = SENSOR_TYPE_UNKNOWN;          /* Type determined after first measurement */
+    sensor->register_time = ktime_get_real_seconds();
+    sensor->sensor_type = SENSOR_TYPE_UNKNOWN;
     sensor->last_attempt_time = 0;
     snprintf(sensor->status_text, STATUS_BUF_LEN, "No measurement taken");
     mutex_init(&sensor->lock);
 
-    /* Step 5: Create procfs entries for this sensor */
+    /* Create procfs entries for this sensor */
     if (dht_create_sensor_proc(sensor)) {
         kfree(sensor);
         return -ENOMEM;
     }
 
-    /* Step 6: Perform an initial measurement to verify the sensor is working.
-     * This is done before adding to the list so a failed sensor doesn't appear
-     * in the list. The measurement is performed without holding any global lock. */
+    /* Perform an initial measurement to verify the sensor is working */
     dht_do_measurement(sensor, false);
 
-    /* Check the measurement result */
     mutex_lock(&sensor->lock);
     ret = sensor->status_code;
     mutex_unlock(&sensor->lock);
 
-    /* If the initial measurement failed, free resources and return an error */
     if (ret != ERR_SUCCESS) {
         pin_err(pin, "registration failed - %s\n", error_str(ret));
         dht_sensor_free(sensor);
         return -EIO;
     }
 
-    /* Step 7: Add the sensor to the global list */
+    /* Add the sensor to the global list */
     mutex_lock(&list_lock);
     list_add(&sensor->list, &sensor_list);
     sensor_count++;
 
-    /* Step 8: Start auto-polling if global auto mode is already active */
+    /* Start auto-polling: global mode takes priority, then per-sensor interval */
     if (READ_ONCE(global_auto_interval) != -1) {
         dht_start_poll(sensor);
         pin_log(pin, "auto-poll enabled by global setting\n");
+    } else if (interval != -1) {
+        dht_start_poll(sensor);
+        pin_log(pin, "auto-poll enabled (interval=%d)\n", interval);
     }
     mutex_unlock(&list_lock);
 
     pin_log(pin, "registered successfully\n");
+    return 0;
+}
+
+static ssize_t export_write(struct file *f, const char __user *buf, size_t count, loff_t *pos)
+{
+    int pin;
+    int ret;
+
+    ret = dht_parse_int(buf, count, &pin);
+    if (ret)
+        return ret;
+
+    ret = dht_do_register(pin, -1);
+    if (ret)
+        return ret;
+
     return count;
 }
 
@@ -1721,6 +1758,212 @@ static bool dht_proc_dir_is_empty(const char *path)
     return empty;
 }
 
+/* ── Configuration file parser ────────────────────────────── */
+
+/**
+ * dht_config_set_auto_interval - Set global auto-poll interval from config
+ * @val: Interval in seconds (2-60), or -1 to disable
+ *
+ * Called during config file parsing to set the global auto-poll interval.
+ * Mirrors the logic of auto_interval_write() but works with kernel-space
+ * values instead of user-space buffers.
+ */
+static void dht_config_set_auto_interval(int val)
+{
+    if (val != -1 && (val < MIN_INTERVAL || val > MAX_INTERVAL)) {
+        dht_err("config: AUTO_INTERVAL=%d out of range (2-60 or -1)\n", val);
+        return;
+    }
+
+    mutex_lock(&list_lock);
+    WRITE_ONCE(global_auto_interval, val);
+
+    if (val != -1) {
+        struct dht_sensor *sensor;
+        list_for_each_entry(sensor, &sensor_list, list) {
+            if (!sensor->poll_thread)
+                dht_start_poll(sensor);
+        }
+    }
+    mutex_unlock(&list_lock);
+
+    dht_info("config: AUTO_INTERVAL=%d\n", val);
+}
+
+/**
+ * dht_parse_config_line - Parse a single line from the config file
+ * @line: Null-terminated, trimmed config line (no leading/trailing whitespace)
+ *
+ * Supported options:
+ *   DEBUG               — enable debug logging (equivalent to DEBUG=1)
+ *   DEBUG=0|1           — explicitly set debug flag
+ *   AUTO_INTERVAL=N    — set global auto-poll interval (2-60, or -1 to disable)
+ *   SENSOR=pin          — register a sensor on the given BCM pin (no auto-poll)
+ *   SENSOR=pin,N        — register a sensor with per-sensor auto-poll interval
+ *
+ * Invalid option names and invalid values produce a warning in dmesg.
+ */
+static void dht_parse_config_line(const char *line)
+{
+    char *eq;
+    char buf[CONFIG_LINE_LEN];
+    char *key, *val;
+
+    /* Make a mutable copy for strsep */
+    strscpy(buf, line, sizeof(buf));
+
+    /* Split into key=value */
+    eq = strchr(buf, '=');
+    if (eq) {
+        *eq = '\0';
+        key = strim(buf);
+        val = strim(eq + 1);
+    } else {
+        key = strim(buf);
+        val = NULL;
+    }
+
+    if (!key || !*key)
+        return;
+
+    /* DEBUG — enable debug logging */
+    if (strcmp(key, "DEBUG") == 0) {
+        int dbg = 1;
+        if (val && *val) {
+            if (kstrtoint(val, 10, &dbg) || (dbg != 0 && dbg != 1)) {
+                dht_err("config: DEBUG='%s' invalid (expected 0 or 1)\n", val);
+                return;
+            }
+        }
+        WRITE_ONCE(dht_debug, dbg);
+        dht_info("config: DEBUG=%d\n", dbg);
+        return;
+    }
+
+    /* AUTO_INTERVAL — global auto-poll interval */
+    if (strcmp(key, "AUTO_INTERVAL") == 0) {
+        int ival;
+        if (!val || !*val) {
+            dht_err("config: AUTO_INTERVAL requires a value (e.g. AUTO_INTERVAL=5)\n");
+            return;
+        }
+        if (kstrtoint(val, 10, &ival)) {
+            dht_err("config: AUTO_INTERVAL='%s' is not a valid integer\n", val);
+            return;
+        }
+        dht_config_set_auto_interval(ival);
+        return;
+    }
+
+    /* SENSOR — register a sensor */
+    if (strcmp(key, "SENSOR") == 0) {
+        int pin = -1, interval = -1;
+        char *comma;
+
+        if (!val || !*val) {
+            dht_err("config: SENSOR requires a pin number (e.g. SENSOR=4)\n");
+            return;
+        }
+
+        /* Check for pin[,interval] format */
+        comma = strchr(val, ',');
+        if (comma) {
+            *comma = '\0';
+            val = strim(val);
+            char *interval_str = strim(comma + 1);
+            if (kstrtoint(val, 10, &pin) || pin < 0 || pin > MAX_PIN_NUM) {
+                dht_err("config: SENSOR pin '%s' invalid (0-%d)\n", val, MAX_PIN_NUM);
+                return;
+            }
+            if (kstrtoint(interval_str, 10, &interval) ||
+                (interval != -1 && (interval < MIN_INTERVAL || interval > MAX_INTERVAL))) {
+                dht_err("config: SENSOR interval '%s' invalid (2-%d or -1)\n", interval_str, MAX_INTERVAL);
+                return;
+            }
+        } else {
+            if (kstrtoint(val, 10, &pin) || pin < 0 || pin > MAX_PIN_NUM) {
+                dht_err("config: SENSOR pin '%s' invalid (0-%d)\n", val, MAX_PIN_NUM);
+                return;
+            }
+        }
+
+        dht_info("config: SENSOR pin=%d interval=%d\n", pin, interval);
+        dht_do_register(pin, interval);
+        return;
+    }
+
+    /* Unknown option */
+    dht_err("config: unknown option '%s'\n", key);
+}
+
+/**
+ * dht_load_config - Read and parse the configuration file at module load
+ *
+ * Opens /etc/default/dht (if it exists) and parses each line for
+ * configuration options (DEBUG, AUTO_INTERVAL, SENSOR).
+ *
+ * The file is optional — if it does not exist or cannot be read,
+ * the driver loads with defaults. Lines starting with '#' and empty
+ * lines are ignored.
+ *
+ * This function is called at the end of dht_driver_init(), after the
+ * procfs hierarchy is set up, so that sensors registered from the config
+ * file get their proc entries created correctly.
+ */
+static void dht_load_config(void)
+{
+    struct file *filp;
+    char *buf;
+    loff_t pos = 0;
+    ssize_t bytes;
+    char *line, *next;
+
+    filp = filp_open(CONFIG_PATH, O_RDONLY, 0);
+    if (IS_ERR(filp)) {
+        dht_dbg("no config file at %s (using defaults)\n", CONFIG_PATH);
+        return;
+    }
+
+    buf = kmalloc(CONFIG_BUF_LEN, GFP_KERNEL);
+    if (!buf) {
+        dht_err("could not allocate buffer for config file\n");
+        filp_close(filp, NULL);
+        return;
+    }
+
+    bytes = kernel_read(filp, buf, CONFIG_BUF_LEN - 1, &pos);
+    filp_close(filp, NULL);
+
+    if (bytes <= 0) {
+        dht_dbg("config file is empty\n");
+        kfree(buf);
+        return;
+    }
+    buf[bytes] = '\0';
+
+    dht_info("reading config from %s (%zd bytes)\n", CONFIG_PATH, bytes);
+
+    /* Parse line by line */
+    line = buf;
+    while (line && *line) {
+        /* Find end of current line */
+        next = strchr(line, '\n');
+        if (next)
+            *next = '\0';
+
+        /* Trim and skip empty lines and comments */
+        {
+            char *trimmed = strim(line);
+            if (*trimmed && *trimmed != '#')
+                dht_parse_config_line(trimmed);
+        }
+
+        line = next ? next + 1 : NULL;
+    }
+
+    kfree(buf);
+}
+
 /* ── Module init / exit ────────────────────────────────────── */
 
 /* Table of global proc entries created under /proc/sensors/dht/ */
@@ -1806,6 +2049,12 @@ static int __init dht_driver_init(void)
             return -ENOMEM;
         }
     }
+
+    /* Read optional configuration file (/etc/default/dht).
+     * This may register sensors, set debug mode, and configure auto-poll
+     * intervals. Called after procfs is set up so registered sensors get
+     * their proc entries created correctly. */
+    dht_load_config();
 
     /* Log successful initialization with the procfs path and max sensor count */
     dht_info("driver loaded - /proc/%s/%s/ (max %d sensors)\n",
