@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2026, Chapvic
  *
- * Version: 2.8.2
+ * Version: 2.8.3
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -99,7 +99,7 @@
 /* Driver metadata constants used in MODULE_* macros and dmesg output */
 #define DHT_DRIVER_AUTHOR        "DHT Driver © 2026, Chapvic"
 #define DHT_DRIVER_DESCRIPTION   "DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver"
-#define DHT_DRIVER_VERSION       "2.8.2"
+#define DHT_DRIVER_VERSION       "2.8.3"
 #define DHT_DRIVER_LICENSE       "GPL"
 
 MODULE_LICENSE(DHT_DRIVER_LICENSE);
@@ -395,7 +395,8 @@ static struct gpio_desc *dht_find_desc(int bcm_pin)
 
 /**
  * dht_read_sensor - Read temperature and humidity from a DHT sensor
- * @pin:  BCM GPIO pin number the sensor is connected to
+ * @pin:  BCM GPIO pin number (used for logging only)
+ * @desc: GPIO descriptor obtained during sensor registration
  * @hum:  Output parameter: humidity value (raw, scaled x10, e.g., 452 = 45.2%)
  * @temp: Output parameter: temperature value (raw, scaled x10, e.g., 231 = 23.1 C, negative if below zero)
  * @type: Output parameter: detected sensor type (SENSOR_TYPE_DHT11 or SENSOR_TYPE_DHT22). May be NULL.
@@ -416,17 +417,17 @@ static struct gpio_desc *dht_find_desc(int bcm_pin)
  * Returns: ERR_SUCCESS on success, ERR_GPIO_REQUEST if GPIO operations fail,
  *          ERR_READ_FAILED if all retry attempts fail.
  */
-static int dht_read_sensor(int pin, int *hum, int *temp, int *type)
+static int dht_read_sensor(int pin, struct gpio_desc *desc, int *hum, int *temp, int *type)
 {
-    struct gpio_desc *desc;
     int data[5] = {0, 0, 0, 0, 0};   /* 5 bytes: RH_int, RH_dec, T_int, T_dec, checksum */
     int last_state = 1;              /* Current GPIO line state (1 = high, idle) */
     int i, j = 0;                    /* i: transition counter, j: bit counter (0-39) */
     u64 pulse_start, pulse_ns;       /* Nanosecond timestamps for pulse width measurement */
     int attempt;                     /* Current retry attempt number */
 
-    /* Resolve the BCM pin number to a GPIO descriptor */
-    desc = dht_find_desc(pin);
+    /* Use the GPIO descriptor obtained during registration (sensor->gpiod).
+     * This avoids re-resolving the pin on every measurement, which could
+     * return a different descriptor if the GPIO subsystem changed. */
     if (!desc) {
         pin_err(pin, "GPIO descriptor not found\n");
         return ERR_GPIO_REQUEST;
@@ -550,9 +551,14 @@ static int dht_read_sensor(int pin, int *hum, int *temp, int *type)
                 /* DHT22: the 16-bit values are already scaled x10 */
             }
 
-            /* Handle negative temperature (bit 7 of data[2] is the sign bit) */
+            /* Handle negative temperature (bit 7 of data[2] is the sign bit).
+             * For DHT22: c = (data[2] << 8) | data[3], so bit 15 is the sign.
+             * Mask the sign bit before negating to get the correct magnitude:
+             *   c = 0x80FB → -(0x00FB) = -251 → T=-25.1 C (correct)
+             * Without the mask: -(0x80FB) = -32763 → wrong magnitude.
+             * For DHT11: data[2] is 0-50, bit 7 is never set, no effect. */
             if (data[2] & 0x80)
-                c = -c;
+                c = -(c & 0x7FFF);
 
             *hum = h;
             *temp = c;
@@ -663,8 +669,10 @@ static void dht_do_measurement(struct dht_sensor *sensor, bool manual)
      * The read takes 20+ ms, which is too long to hold a mutex. */
     mutex_unlock(&sensor->lock);
 
-    /* Perform the actual GPIO read (may take multiple retries) */
-    ret = dht_read_sensor(sensor->pin, &hum, &temp, &type);
+    /* Perform the actual GPIO read (may take multiple retries).
+     * Pass the descriptor stored during registration to avoid
+     * re-resolving the pin on every measurement. */
+    ret = dht_read_sensor(sensor->pin, sensor->gpiod, &hum, &temp, &type);
 
     /* Release the measuring flag */
     atomic_set(&sensor->measuring, 0);
@@ -685,8 +693,12 @@ static void dht_do_measurement(struct dht_sensor *sensor, bool manual)
         if (sensor->sensor_type == SENSOR_TYPE_UNKNOWN)
             sensor->sensor_type = type;
         sensor->last_meas_time = sensor->last_attempt_time;
-        pin_dbg(sensor->pin, "measurement OK - H=%d.%d%% T=%d.%d C\n",
-                hum / 10, hum % 10, temp / 10, temp % 10);
+        if (temp < 0)
+            pin_dbg(sensor->pin, "measurement OK - H=%d.%d%% T=-%d.%d C\n",
+                    hum / 10, hum % 10, (-temp) / 10, (-temp) % 10);
+        else
+            pin_dbg(sensor->pin, "measurement OK - H=%d.%d%% T=%d.%d C\n",
+                    hum / 10, hum % 10, temp / 10, temp % 10);
     } else {
         /* Log the failure reason (debug only) */
         pin_dbg(sensor->pin, "measurement failed - %s\n", error_str(ret));
@@ -2321,6 +2333,10 @@ static void __exit dht_driver_exit(void)
      * the list is private (tmp_list) and no procfs access is possible. */
     list_for_each_entry_safe(sensor, tmp, &tmp_list, list) {
         list_del(&sensor->list);
+        /* proc_remove(proc_dir) in Phase 1 already removed all gpio<pin>/
+         * subdirectories. Clear proc_dir to prevent dht_sensor_release
+         * from calling proc_remove on already-freed memory (use-after-free). */
+        sensor->proc_dir = NULL;
         /* Drop the list's reference. If no procfs files are open (should
          * be the case after proc_remove), the sensor is freed immediately. */
         dht_sensor_put(sensor);
