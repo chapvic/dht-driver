@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2026, Chapvic
  *
- * Version: 2.7
+ * Version: 2.8
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -93,11 +93,13 @@
 #include <linux/time.h>
 #include <linux/ktime.h>
 #include <linux/atomic.h>
+#include <linux/kref.h>
+#include <linux/preempt.h>
 
 /* Driver metadata constants used in MODULE_* macros and dmesg output */
 #define DHT_DRIVER_AUTHOR        "DHT Driver © 2026, Chapvic"
 #define DHT_DRIVER_DESCRIPTION   "DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver"
-#define DHT_DRIVER_VERSION       "2.7"
+#define DHT_DRIVER_VERSION       "2.8"
 #define DHT_DRIVER_LICENSE       "GPL"
 
 MODULE_LICENSE(DHT_DRIVER_LICENSE);
@@ -111,7 +113,6 @@ MODULE_VERSION(DHT_DRIVER_VERSION);
 #define PROC_PARENT      "sensors"  /* Parent procfs directory name (/proc/sensors) */
 #define PROC_DIR_NAME    "dht"      /* Driver procfs directory name (/proc/sensors/dht) */
 #define STATUS_BUF_LEN   128        /* Maximum length of the human-readable status text buffer */
-#define LOG_BUF_LEN      256        /* Maximum length of log message buffers */
 #define INFO_BUF_LEN     256        /* Maximum length of the sensor info text buffer */
 #define MAX_SENSORS      32         /* Maximum number of simultaneously registered sensors */
 #define MAX_PIN_NUM      27         /* Highest valid BCM GPIO pin number on Raspberry Pi */
@@ -240,10 +241,10 @@ struct dht_sensor {
     time64_t register_time;           /* Unix timestamp when the sensor was registered */
     time64_t last_meas_time;          /* Unix timestamp of the last successful measurement */
     time64_t last_attempt_time;       /* Unix timestamp of the last measurement attempt (used for rate limiting) */
-    char info_text[INFO_BUF_LEN];     /* Pre-formatted info text (currently unused, reserved) */
     struct mutex lock;                /* Mutex protecting all fields above from concurrent access */
     struct proc_dir_entry *proc_dir;  /* Pointer to the sensor's procfs subdirectory (/proc/sensors/dht/gpio<pin>/) */
     struct task_struct *poll_thread;  /* Kernel thread for background polling (NULL if not running) */
+    struct kref refcount;              /* Reference count: prevents use-after-free during unexport */
     struct list_head list;            /* Linked list node for the global sensor list */
 };
 
@@ -429,6 +430,14 @@ static int dht_read_sensor(int pin, int *hum, int *temp, int *type)
         return ERR_GPIO_REQUEST;
     }
 
+    /* Warn if this GPIO is behind a sleeping expander (e.g., I2C GPIO
+     * chip). The bit-bang timing loop uses non-sleeping gpiod_get_value
+     * in a tight loop and will not work correctly with sleeping GPIOs. */
+    if (gpiod_cansleep(desc)) {
+        pin_err(pin, "GPIO is on a sleeping chip — timing-critical reads will not work\n");
+        return ERR_GPIO_REQUEST;
+    }
+
     /* Retry loop: DHT sensors sometimes fail to respond on the first attempt */
     for (attempt = 0; attempt < MAX_RETRIES; attempt++) {
         /* Clear data buffer and reset counters for each attempt */
@@ -459,7 +468,14 @@ static int dht_read_sensor(int pin, int *hum, int *temp, int *type)
         /* Step 3: Read the 40 data bits by measuring pulse widths.
          * Each bit consists of a low pulse (~50 us) followed by a high pulse.
          * The high pulse duration determines the bit value:
-         *   ~26 us = 0, ~70 us = 1. */
+         *   ~26 us = 0, ~70 us = 1.
+         *
+         * Disable preemption for the duration of the bit-bang read (~4 ms
+         * worst case) to prevent timing corruption from context switches.
+         * Interrupts are NOT disabled to avoid affecting system latency;
+         * the DHT protocol's ~70 us pulses are wide enough that occasional
+         * IRQ jitter is tolerable. */
+        preempt_disable();
         for (i = 0; i < MAX_TIMINGS && j < 40; i++) {
             /* Record the start time of the current pulse level */
             pulse_start = ktime_get_ns();
@@ -488,6 +504,7 @@ static int dht_read_sensor(int pin, int *hum, int *temp, int *type)
                 j++;
             }
         }
+        preempt_enable();
 
         /* Step 4: Validate the checksum and extract values.
          * The 5th byte is the sum of the first 4 bytes (mod 256). */
@@ -500,20 +517,21 @@ static int dht_read_sensor(int pin, int *hum, int *temp, int *type)
              * DHT11 sends integer values in byte 0 and 2, with byte 1 and 3 = 0.
              * When the combined 16-bit humidity > 1000, it indicates the raw
              * byte 0 value is > 100 (e.g., 45*256 + 0 = 11520 > 1000),
-             * which means it's a DHT11 with integer-only format. */
+             * which means it's a DHT11 with integer-only format.
+             *
+             * The humidity check is authoritative: once the type is determined
+             * from humidity, the same type is used for temperature interpretation.
+             * This avoids a bug where DHT11 temperatures below 5 C were
+             * misinterpreted as DHT22 values (c <= 1250, no conversion applied). */
             if (h > 1000) {
                 if (type) *type = SENSOR_TYPE_DHT11;
-                /* DHT11: use only the integer byte, scale by 10 for consistent units */
+                /* DHT11: use only the integer bytes, scale by 10 for consistent units */
                 h = data[0] * 10;
+                c = data[2] * 10;
             } else {
                 if (type) *type = SENSOR_TYPE_DHT22;
-                /* DHT22: the 16-bit value is already scaled x10 */
+                /* DHT22: the 16-bit values are already scaled x10 */
             }
-
-            /* Same heuristic for temperature: if the 16-bit value > 1250,
-             * it's a DHT11 with integer-only format. */
-            if (c > 1250)
-                c = data[2] * 10;
 
             /* Handle negative temperature (bit 7 of data[2] is the sign bit) */
             if (data[2] & 0x80)
@@ -621,10 +639,15 @@ static void dht_do_measurement(struct dht_sensor *sensor, bool manual)
     snprintf(sensor->status_text, STATUS_BUF_LEN, "%s", error_str(ret));
 
     if (ret == ERR_SUCCESS) {
-        /* Update measurement results on success */
+        /* Update measurement results on success.
+         * Sensor type is determined once and then locked — it does not
+         * change between measurements. This prevents spurious type flips
+         * caused by borderline humidity readings (e.g., DHT22 reporting
+         * 100.1% could briefly trigger the DHT11 heuristic). */
         sensor->humidity_raw = hum;
         sensor->temperature_raw = temp;
-        sensor->sensor_type = type;
+        if (sensor->sensor_type == SENSOR_TYPE_UNKNOWN)
+            sensor->sensor_type = type;
         sensor->last_meas_time = sensor->last_attempt_time;
         pin_dbg(sensor->pin, "measurement OK - H=%d.%d%% T=%d.%d C\n",
                 hum / 10, hum % 10, temp / 10, temp % 10);
@@ -673,6 +696,15 @@ static int dht_poll_thread_fn(void *data)
         else
             effective_interval = sensor->interval;
         mutex_unlock(&sensor->lock);
+
+        /* If both global and per-sensor intervals are disabled (-1),
+         * the thread should stop — there is nothing to poll for.
+         * This can happen when auto_interval is set to -1 while the
+         * thread was started by a previous non-zero global setting. */
+        if (effective_interval == -1) {
+            pin_dbg(sensor->pin, "both intervals disabled, poll thread exiting\n");
+            break;
+        }
 
         /* Safety fallback: ensure a minimum interval */
         if (effective_interval < 1)
@@ -740,20 +772,69 @@ static void dht_stop_poll(struct dht_sensor *sensor)
     kthread_stop(thread);
 }
 
-/* ── Unified sensor cleanup ────────────────────────────────── */
+/* ── Reference counting and unified sensor cleanup ─────────── */
 
 /**
- * dht_sensor_free - Free all resources associated with a sensor
+ * dht_sensor_get - Acquire a reference to a sensor
+ * @sensor: Pointer to the sensor instance
+ *
+ * Increments the kref refcount. Returns the sensor pointer on success,
+ * or NULL if the refcount was already zero (sensor is being freed).
+ *
+ * Must be called under list_lock or when a reference is already held.
+ *
+ * Returns: sensor pointer on success, NULL on failure.
+ */
+static struct dht_sensor *dht_sensor_get(struct dht_sensor *sensor)
+{
+    if (!sensor)
+        return NULL;
+    if (!kref_get_unless_zero(&sensor->refcount))
+        return NULL;
+    return sensor;
+}
+
+/**
+ * dht_sensor_release - kref release callback — frees all sensor resources
+ * @ref: Pointer to the kref embedded in struct dht_sensor
+ *
+ * Called when the last reference to the sensor is dropped. This performs
+ * the complete teardown: stop poll thread, remove procfs entries,
+ * destroy mutex, free memory.
+ */
+static void dht_sensor_release(struct kref *ref)
+{
+    struct dht_sensor *sensor = container_of(ref, struct dht_sensor, refcount);
+
+    dht_stop_poll(sensor);              /* Stop the background polling thread */
+    proc_remove(sensor->proc_dir);      /* Remove all procfs entries for this sensor */
+    mutex_destroy(&sensor->lock);       /* Clean up the mutex */
+    kfree(sensor);                      /* Free the sensor struct */
+}
+
+/**
+ * dht_sensor_put - Drop a reference to a sensor
+ * @sensor: Pointer to the sensor instance
+ *
+ * Decrements the kref refcount. If this was the last reference,
+ * dht_sensor_release() is called to free all resources.
+ */
+static void dht_sensor_put(struct dht_sensor *sensor)
+{
+    if (sensor)
+        kref_put(&sensor->refcount, dht_sensor_release);
+}
+
+/**
+ * dht_sensor_free - Drop the initial reference, freeing the sensor if last
  * @sensor: Pointer to the sensor instance to free
  *
- * This function performs the complete teardown of a sensor:
- *   1. Stops the background polling thread (if running)
- *   2. Removes the sensor's procfs directory and all its entries
- *   3. Destroys the sensor's mutex
- *   4. Frees the sensor struct memory
+ * Convenience wrapper around dht_sensor_put(). Used during registration
+ * failure and unexport. If no open procfs files hold a reference, the
+ * sensor is freed immediately.
  *
  * It is called from:
- *   - export_write() when initial measurement fails after registration
+ *   - dht_do_register() when initial measurement fails after registration
  *   - unexport_write() when the user unregisters a sensor
  *
  * Note: dht_driver_exit() does NOT call this function — it performs its own
@@ -762,10 +843,7 @@ static void dht_stop_poll(struct dht_sensor *sensor)
  */
 static void dht_sensor_free(struct dht_sensor *sensor)
 {
-    dht_stop_poll(sensor);              /* Stop the background polling thread */
-    proc_remove(sensor->proc_dir);      /* Remove all procfs entries for this sensor */
-    mutex_destroy(&sensor->lock);       /* Clean up the mutex */
-    kfree(sensor);                      /* Free the sensor struct */
+    dht_sensor_put(sensor);
 }
 
 /* ── Input parsing helper ──────────────────────────────────── */
@@ -819,6 +897,8 @@ static int dht_parse_int(const char __user *buf, size_t count, int *val)
  */
 static int dht_proc_open(struct inode *inode, struct file *f)
 {
+    struct dht_sensor *sensor;
+
     /* Reject new opens if the module is being unloaded */
     if (atomic_read(&dht_exiting))
         return -ENODEV;
@@ -826,6 +906,17 @@ static int dht_proc_open(struct inode *inode, struct file *f)
     /* Increment module reference count to prevent rmmod while file is open */
     if (!try_module_get(THIS_MODULE))
         return -ENODEV;
+
+    /* For per-sensor entries, acquire a reference to the sensor struct
+     * to prevent use-after-free if the sensor is unregistered while
+     * the procfs file is still open. Global entries have no PDE_DATA. */
+    sensor = DHT_PDE_DATA(inode);
+    if (sensor) {
+        if (!dht_sensor_get(sensor)) {
+            module_put(THIS_MODULE);
+            return -ENODEV;
+        }
+    }
 
     return 0;
 }
@@ -843,6 +934,13 @@ static int dht_proc_open(struct inode *inode, struct file *f)
  */
 static int dht_proc_release(struct inode *inode, struct file *f)
 {
+    struct dht_sensor *sensor;
+
+    /* Drop the sensor reference acquired in dht_proc_open (if any) */
+    sensor = DHT_PDE_DATA(inode);
+    if (sensor)
+        dht_sensor_put(sensor);
+
     module_put(THIS_MODULE);
     return 0;
 }
@@ -1024,7 +1122,10 @@ static ssize_t auto_interval_write(struct file *f, const char __user *buf, size_
     }
 
     /* If global auto mode is now active, start poll threads for all sensors
-     * that don't have one running yet. */
+     * that don't have one running yet.
+     * If global auto mode was just disabled, existing poll threads will
+     * detect the change on their next loop iteration and self-terminate
+     * if the per-sensor interval is also -1. */
     if (READ_ONCE(global_auto_interval) != -1) {
         struct dht_sensor *sensor;
         list_for_each_entry(sensor, &sensor_list, list) {
@@ -1544,10 +1645,14 @@ static int dht_do_register(int pin, int interval)
     sensor->last_attempt_time = 0;
     snprintf(sensor->status_text, STATUS_BUF_LEN, "No measurement taken");
     mutex_init(&sensor->lock);
+    kref_init(&sensor->refcount);   /* Start with refcount = 1 (owned by list) */
 
     /* Create procfs entries for this sensor */
     if (dht_create_sensor_proc(sensor)) {
-        kfree(sensor);
+        /* kref was already initialized above; use put to release it
+         * properly rather than kfree (no procfs entries exist yet,
+         * so this will immediately call dht_sensor_release). */
+        dht_sensor_put(sensor);
         return -ENOMEM;
     }
 
@@ -1564,8 +1669,18 @@ static int dht_do_register(int pin, int interval)
         return -EIO;
     }
 
-    /* Add the sensor to the global list */
+    /* Add the sensor to the global list — re-check for duplicates under
+     * the lock to close the TOCTOU window between the initial check
+     * and the list_add. */
     mutex_lock(&list_lock);
+    list_for_each_entry(s, &sensor_list, list) {
+        if (s->pin == pin) {
+            mutex_unlock(&list_lock);
+            dht_err("pin %d raced with concurrent registration\n", pin);
+            dht_sensor_free(sensor);
+            return -EBUSY;
+        }
+    }
     list_add(&sensor->list, &sensor_list);
     sensor_count++;
 
@@ -2130,9 +2245,9 @@ static void __exit dht_driver_exit(void)
      * the list is private (tmp_list) and no procfs access is possible. */
     list_for_each_entry_safe(sensor, tmp, &tmp_list, list) {
         list_del(&sensor->list);
-        dht_stop_poll(sensor);
-        mutex_destroy(&sensor->lock);
-        kfree(sensor);
+        /* Drop the list's reference. If no procfs files are open (should
+         * be the case after proc_remove), the sensor is freed immediately. */
+        dht_sensor_put(sensor);
     }
 
     dht_info("driver unloaded\n");

@@ -1,236 +1,150 @@
 ================================================================================
-  DHT11/DHT22/AM2302 Kernel Driver — Changelog
-  Copyright (c) 2026, Chapvic
-  License: GPL v3
+                        DHT Kernel Module — Changelog
 ================================================================================
 
-------------------------------------------------------------------------------
-  v2.7                                                  (21 Sep 2026)
-------------------------------------------------------------------------------
+Version 2.8  (21.09.2026)
+────────────────────────────────────────────────────────────────────────────────
 
-  NEW FEATURE: Configuration File Support
-  =======================================
+  Bug fixes and reliability improvements over v2.7.
 
-  The driver now reads an optional configuration file at module load time.
-  This allows automatic sensor registration, debug mode activation, and
-  global auto-poll configuration without manual procfs writes after
-  insmod.
+  Critical
+  ────────
+  1. Use-after-free on unexport
+     Added struct kref refcount to dht_sensor. In dht_proc_open, a sensor
+     reference is acquired (kref_get_unless_zero). In dht_proc_release, the
+     reference is released (kref_put). The sensor is freed only when the last
+     file descriptor is closed. dht_sensor_release (kref callback) performs:
+     stop_poll -> proc_remove -> mutex_destroy -> kfree.
 
-  File path: /etc/default/dht (optional — driver loads with defaults
-  if the file is missing).
+  2. TOCTOU race during registration
+     In dht_do_register, a duplicate check is performed again under list_lock
+     immediately before list_add. If two threads passed the initial check
+     simultaneously, the second one gets -EBUSY and frees the sensor via
+     dht_sensor_put.
 
-  Configuration file format:
+  3. Poll thread does not stop
+     In dht_poll_thread_fn, the loop now breaks when effective_interval == -1
+     (both global and per-sensor intervals disabled). Previously the thread
+     could spin indefinitely if global auto_interval was set to -1 after
+     the thread was started.
 
-    Lines starting with '#' and empty lines are ignored.
-    Options are processed top-to-bottom in order of appearance.
+  Logic
+  ─────
+  4. DHT11 temperature below 5 C
+     Temperature is now interpreted based on the sensor type determined from
+     humidity: if h > 1000 (DHT11), c = data[2] * 10 is performed in the same
+     branch. Removed the separate heuristic "if (c > 1250)" which skipped
+     values 0-4 C for DHT11 sensors.
 
-    Global options:
-      DEBUG                  Enable debug logging at load (same as DEBUG=1)
-      DEBUG=0                Explicitly disable debug logging
-      DEBUG=1                Explicitly enable debug logging
-      AUTO_INTERVAL=N        Set global auto-poll interval in seconds (2-60)
-                             Starts polling for all registered sensors
-      AUTO_INTERVAL=-1       Disable global auto-poll
+  5. Sensor type fluctuation
+     In dht_do_measurement, the sensor type is now written only if
+     sensor_type == SENSOR_TYPE_UNKNOWN. The first successful measurement
+     locks the type permanently, preventing spurious type flips caused by
+     borderline humidity readings.
 
-    Sensor registration:
-      SENSOR=<pin>           Register a sensor on the given BCM pin number
-                             (no auto-poll unless AUTO_INTERVAL is set)
-      SENSOR=<pin>,<N>       Register with per-sensor auto-poll interval
-                             N = 2-60 seconds
+  Reliability
+  ───────────
+  6. Preemption in timing-critical section
+     Added preempt_disable() / preempt_enable() around the 40-bit bit-bang
+     read loop in dht_read_sensor. Interrupts are NOT disabled — the DHT
+     protocol's ~70 us pulses are wide enough that IRQ jitter is tolerable.
 
-    Example file:
+  7. gpiod_cansleep() check
+     If the GPIO is behind a sleeping expander (e.g., I2C GPIO chip), reading
+     now immediately returns ERR_GPIO_REQUEST with a diagnostic message in
+     dmesg, instead of silently producing corrupted data.
 
-      # /etc/default/dht
-      DEBUG=1
-      AUTO_INTERVAL=10
-      SENSOR=4               # DHT22 on GPIO4, uses global interval
-      SENSOR=17,5            # DHT11 on GPIO17, polls every 5 seconds
-      SENSOR=22              # Sensor on GPIO22, no auto-poll
+  Code cleanup
+  ────────────
+  8. Dead code removed
+     Removed LOG_BUF_LEN (was defined but never used) and info_text[INFO_BUF_LEN]
+     field from struct dht_sensor (256 bytes per sensor, never used).
+     INFO_BUF_LEN is retained — used as the local buffer size in sensor_info_read.
 
-  Error handling:
-    - Missing config file         → driver loads normally (debug message only)
-    - Unknown option name         → dmesg warning: "config: unknown option 'XXX'"
-    - Invalid SENSOR pin          → dmesg warning: "config: SENSOR pin 'XX' invalid"
-    - Invalid SENSOR interval     → dmesg warning: "config: SENSOR interval 'XX' invalid"
-    - Invalid DEBUG value         → dmesg warning: "config: DEBUG='XX' invalid"
-    - Invalid AUTO_INTERVAL value → dmesg warning: "config: AUTO_INTERVAL='XX' ..."
+  9. kfree -> dht_sensor_put
+     In the error path of dht_create_sensor_proc in dht_do_register, direct
+     kfree is replaced with dht_sensor_put, since kref_init was already called
+     before the error path.
 
-  Implementation details:
-  ---------------------------------------------------------------------------
-
-  1. dht_do_register(int pin, int interval) — NEW FUNCTION
-     -------------------------------------------------------
-
-     The full sensor registration logic (pin validation, duplicate check,
-     GPIO resolution, kzalloc, procfs creation, initial measurement, list
-     insertion, auto-poll start) has been extracted from export_write()
-     into a standalone function.
-
-     Parameters:
-       pin      — BCM GPIO pin number (0-27)
-       interval — auto-poll interval in seconds (2-60), or -1 to disable
-
-     Returns: 0 on success, negative errno on failure.
-
-     This extraction allows both export_write() and the config file
-     parser to register sensors through the same code path, eliminating
-     duplication.
-
-  2. export_write() — SIMPLIFIED
-     -----------------------------
-
-     Now a thin wrapper: parses the BCM pin number from user-space input
-     and calls dht_do_register(pin, -1). All registration logic lives in
-     dht_do_register().
-
-  3. dht_config_set_auto_interval(int val) — NEW FUNCTION
-     -------------------------------------------------------
-
-     Kernel-space counterpart of auto_interval_write(). Sets the global
-     auto-poll interval from the config file. When a valid interval
-     (2-60) is set, starts poll threads for all already-registered
-     sensors that don't have one running yet.
-
-  4. dht_parse_config_line(const char *line) — NEW FUNCTION
-     -------------------------------------------------------
-
-     Parses a single trimmed config line. Splits on '=' into key/value,
-     then dispatches to the appropriate handler:
-
-       DEBUG    → sets dht_debug via WRITE_ONCE
-       AUTO_INTERVAL → calls dht_config_set_auto_interval()
-       SENSOR   → parses "pin" or "pin,interval", calls dht_do_register()
-
-     Invalid keys and values produce dmesg warnings via dht_err().
-
-     Uses a local buffer of CONFIG_LINE_LEN (256 bytes) — not
-     CONFIG_BUF_LEN (4096) — to avoid the -Wframe-larger-than warning.
-     The function processes one line at a time from the kmalloc'd
-     buffer in dht_load_config(), so 256 bytes is sufficient.
-
-  5. dht_load_config() — NEW FUNCTION
-     -------------------------------------------------------
-
-     Opens /etc/default/dht via VFS (filp_open + kernel_read). Allocates
-     a CONFIG_BUF_LEN (4096) byte buffer via kmalloc — NOT on the stack
-     — to avoid exceeding the kernel's 2048-byte stack frame limit.
-
-     Reads the entire file (up to 4095 bytes), null-terminates it, then
-     splits into lines (handling both \n and \r\n). Each non-empty,
-     non-comment line is passed to dht_parse_config_line().
-
-     If the file does not exist (IS_ERR on filp_open), the function
-     returns silently with a debug message. If kmalloc fails, logs an
-     error and returns.
-
-  6. dht_driver_init() — MODIFIED
-     -------------------------------------------------------
-
-     Added call to dht_load_config() at the END of the init function,
-     after all procfs entries are created. This ensures that sensors
-     registered from the config file get their per-sensor proc entries
-     created correctly.
-
-  7. New preprocessor constants
-     -------------------------------------------------------
-
-     CONFIG_PATH       "/etc/default/dht"   Path to the config file
-     CONFIG_BUF_LEN    4096                 Max config file size (kmalloc)
-     CONFIG_LINE_LEN   256                 Max single config line (stack)
-
-  8. Header comment updated
-     -------------------------------------------------------
-
-     Added a "Configuration file" section to the file header comment,
-     documenting all options, format, and an example, in the same style
-     as the existing procfs interface documentation.
+  Intentionally not changed
+  ─────────────────────────
+  - gpiod_to_chip() / gpio_to_desc() are deprecated but replacing them with
+    gpiod_get() via device tree requires a full rework of the registration
+    model. Left as-is with the understanding that migration will be needed in
+    future kernels.
+  - procfs permissions (0666 for debug/auto_interval) are a user/distribution
+    choice, not a bug.
 
 
-  Ordering semantics
-  ==================
+Version 2.7  (21.09.2026)
+────────────────────────────────────────────────────────────────────────────────
 
-  Config options are processed top-to-bottom. This matters for
-  AUTO_INTERVAL and SENSOR interaction:
+  Configuration file support
 
-  - If AUTO_INTERVAL=10 appears BEFORE SENSOR=4:
-    The global interval is set first. When SENSOR=4 is registered,
-    dht_do_register() detects the active global interval and starts
-    the poll thread automatically.
+  New feature: optional configuration file /etc/default/dht, read at module
+  load time. If the file is missing, the driver loads with defaults.
 
-  - If AUTO_INTERVAL=10 appears AFTER SENSOR=4:
-    SENSOR=4 is registered first without auto-poll. Then AUTO_INTERVAL
-    calls dht_config_set_auto_interval(), which iterates over all
-    registered sensors and starts poll threads for those that don't
-    have one yet.
+  Format:
+    - Lines starting with '#' and empty lines are ignored
+    - Unknown options produce warnings in dmesg
+    - Invalid values produce warnings in dmesg
 
-  Both orderings produce the same end state: all registered sensors
-  are polled at the global interval.
+  Global options:
+    DEBUG              Enable debug logging at load (= DEBUG=1)
+    DEBUG=0|1          Explicitly disable/enable debug logging
+    AUTO_INTERVAL=n    Global auto-poll interval in seconds (2-60)
 
+  Sensor registration:
+    SENSOR=<pin>       Register a sensor on the given BCM pin (no auto-poll)
+    SENSOR=<pin>,<n>   Register with per-sensor auto-poll interval (2-60 sec)
 
-  Files in this release
-  ======================
+  Implementation:
+    - dht_do_register(pin, interval) extracted from export_write
+    - dht_parse_config_line() parses one line at a time
+    - dht_load_config() reads /etc/default/dht via VFS (filp_open + kernel_read)
+    - Buffer allocated via kmalloc (no stack overflow)
+    - Called at the end of dht_driver_init after procfs is set up
 
-    dht.c               DHT driver source (v2.7)
-    changelog.txt       This file
-    README.md           English documentation
-    README_RU.md        Russian documentation
-    ReleaseNotes.md     GitHub release notes
-
-
-  Compatibility
-  =============
-
-    Kernel:     5.15+ (tested on 6.1, 6.6, 6.18)
-    Arch:       aarch64 (Raspberry Pi 3/4/5)
-    Sensors:    DHT11, DHT22, AM2302
+  Options are processed top-to-bottom:
+    - AUTO_INTERVAL before SENSOR: sensor gets global interval at registration
+    - AUTO_INTERVAL after SENSOR: sensor registers first, then global polling
+      starts for all existing sensors
 
 
-------------------------------------------------------------------------------
-  v2.6                                                  (previous release)
-------------------------------------------------------------------------------
+Version 2.6  (20.09.2026)
+────────────────────────────────────────────────────────────────────────────────
 
-  Shared /proc/sensors coexistence
-  =================================
-  - Ownership flag (we_created_parent) tracks whether the driver created
-    /proc/sensors or reused an existing directory
-  - remove_proc_subtree("sensors") removed — no longer destroys other
-    drivers' entries
-  - Smart init: creates /proc/sensors only if it doesn't exist; creates
-    /proc/sensors/dht under existing parent if present
-  - Smart exit: removes only /proc/sensors/dht; checks /proc/sensors
-    emptiness via VFS iteration before removing the parent
-  - dht_proc_dir_is_empty() uses filp_open + iterate_dir (struct
-    proc_dir_entry is opaque in modern kernels)
+  Shared /proc/sensors, safe unload, rate limiting, GPIO chip detection
 
-  Safe module unloading
-  =====================
-  - try_module_get() in dht_proc_open() prevents rmmod while files are open
-  - dht_exiting atomic flag blocks new opens during unload
-  - Two-phase exit: remove procfs first, then stop threads and free memory
-
-  Rate limiting
-  =============
-  - MEAS_MIN_GAP (2 seconds) applies to ALL measurements (manual + auto)
-  - Manual measurements return ERR_TOO_SOON if too soon
-  - Auto-poll measurements silently skip if too soon
-
-  GPIO chip detection
-  ====================
-  - Three-stage lookup: cached base → direct → full scan
-  - Supports Pi 5 (base offset 512+) via chip label matching
-  - cached_chip_base set once, reused for all subsequent registrations
+  - Shared /proc/sensors: driver creates /proc/sensors only if it does not
+    exist; removes it on unload only if it created it and it is empty
+  - Safe module unload with two-phase teardown and module reference counting
+  - Rate limiting for all measurements (manual and auto-poll, min 2 s gap)
+  - GPIO chip detection: three-stage lookup (cached base, direct, full scan)
+    with chip label verification for Pi 3/4/5 compatibility
+  - Nanosecond-precision pulse timing for reliable reads across all Pi models
 
 
-------------------------------------------------------------------------------
-  v2.5                                                  (initial release)
-------------------------------------------------------------------------------
+Version 2.5  (18.09.2026)
+────────────────────────────────────────────────────────────────────────────────
 
-  - Dynamic sensor export/unexport via procfs
-  - Per-sensor proc entries: pin, interval, measure, status_code,
-    status_text, value, info, timestamp
+  Initial release
+
+  - Dynamic sensor export/unexport via procfs (/proc/sensors/dht/)
+  - Per-sensor proc entries: pin, interval, measure, status_code, status_text,
+    value, info, timestamp
+  - Background polling thread with configurable per-sensor interval
   - Global auto-poll mode with shared interval
-  - Background polling thread per sensor
-  - Nanosecond-precision pulse timing for DHT protocol
-  - Support for DHT11, DHT22, and AM2302 sensors
-  - Up to 32 simultaneously registered sensors
-  - Compatible with kernel 5.15+ (proc_ops/pde_data abstraction)
+  - Supports DHT11, DHT22, AM2302 sensors
+  - Compatible with Raspberry Pi 3/4/5 (BCM2835, BCM2711, RP1 GPIO chips)
+
+
+================================================================================
+                        Compatibility
+================================================================================
+
+  Kernel:     5.10+ (tested up to 6.18)
+  Arch:       ARM64 (aarch64)
+  Hardware:   Raspberry Pi 3/4/5 (and Pi Zero 2 W)
+  Sensors:    DHT11, DHT22, AM2302
+  Backward:   Compatible with v2.5 and v2.6 procfs interface
