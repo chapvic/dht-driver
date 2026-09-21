@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2026, Chapvic
  *
- * Version: 2.8
+ * Version: 2.8.1 (critical patch)
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -99,7 +99,7 @@
 /* Driver metadata constants used in MODULE_* macros and dmesg output */
 #define DHT_DRIVER_AUTHOR        "DHT Driver © 2026, Chapvic"
 #define DHT_DRIVER_DESCRIPTION   "DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver"
-#define DHT_DRIVER_VERSION       "2.8"
+#define DHT_DRIVER_VERSION       "2.8.1"
 #define DHT_DRIVER_LICENSE       "GPL"
 
 MODULE_LICENSE(DHT_DRIVER_LICENSE);
@@ -244,6 +244,7 @@ struct dht_sensor {
     struct mutex lock;                /* Mutex protecting all fields above from concurrent access */
     struct proc_dir_entry *proc_dir;  /* Pointer to the sensor's procfs subdirectory (/proc/sensors/dht/gpio<pin>/) */
     struct task_struct *poll_thread;  /* Kernel thread for background polling (NULL if not running) */
+    struct gpio_desc *gpiod;          /* Requested GPIO descriptor (owned by this sensor) */
     struct kref refcount;              /* Reference count: prevents use-after-free during unexport */
     struct list_head list;            /* Linked list node for the global sensor list */
 };
@@ -477,6 +478,11 @@ static int dht_read_sensor(int pin, int *hum, int *temp, int *type)
          * IRQ jitter is tolerable. */
         preempt_disable();
         for (i = 0; i < MAX_TIMINGS && j < 40; i++) {
+            /* Initialize pulse_ns to 0 so that if the while loop body
+             * never executes (line already changed state), we don't
+             * use a stale/garbage value for bit decoding or timeout check. */
+            pulse_ns = 0;
+
             /* Record the start time of the current pulse level */
             pulse_start = ktime_get_ns();
 
@@ -702,8 +708,23 @@ static int dht_poll_thread_fn(void *data)
          * This can happen when auto_interval is set to -1 while the
          * thread was started by a previous non-zero global setting. */
         if (effective_interval == -1) {
-            pin_dbg(sensor->pin, "both intervals disabled, poll thread exiting\n");
-            break;
+            pin_dbg(sensor->pin, "both intervals disabled, poll thread idle\n");
+            /* Sleep in 1-second increments until asked to stop
+             * or an interval gets re-enabled by the user.
+             * Do NOT break out of the main loop — if the thread
+             * exits on its own, task_struct is freed but
+             * sensor->poll_thread becomes a dangling pointer. */
+            while (!kthread_should_stop()) {
+                mutex_lock(&sensor->lock);
+                if (READ_ONCE(global_auto_interval) != -1 ||
+                    sensor->interval != -1) {
+                    mutex_unlock(&sensor->lock);
+                    break;  /* exit idle loop, resume polling */
+                }
+                mutex_unlock(&sensor->lock);
+                ssleep(1);
+            }
+            continue;  /* re-check kthread_should_stop in main loop */
         }
 
         /* Safety fallback: ensure a minimum interval */
@@ -807,6 +828,8 @@ static void dht_sensor_release(struct kref *ref)
     struct dht_sensor *sensor = container_of(ref, struct dht_sensor, refcount);
 
     dht_stop_poll(sensor);              /* Stop the background polling thread */
+    if (sensor->gpiod)
+        gpio_free(desc_to_gpio(sensor->gpiod));  /* Release the GPIO line */
     proc_remove(sensor->proc_dir);      /* Remove all procfs entries for this sensor */
     mutex_destroy(&sensor->lock);       /* Clean up the mutex */
     kfree(sensor);                      /* Free the sensor struct */
@@ -1556,8 +1579,11 @@ static int dht_create_sensor_proc(struct dht_sensor *sensor)
     for (i = 0; i < ARRAY_SIZE(sensor_proc_entries); i++) {
         const struct proc_entry_def *e = &sensor_proc_entries[i];
         if (!proc_create_data(e->name, e->mode, sensor->proc_dir, e->fops, sensor)) {
-            /* If any entry fails, clean up the entire directory */
+            /* If any entry fails, clean up the entire directory.
+             * Must NULL the pointer so dht_sensor_release() won't
+             * call proc_remove() again on the already-freed entry. */
             proc_remove(sensor->proc_dir);
+            sensor->proc_dir = NULL;
             return -ENOMEM;
         }
     }
@@ -1624,6 +1650,18 @@ static int dht_do_register(int pin, int interval)
         return -ENODEV;
     }
 
+    /* Request (claim) the GPIO line so no other driver can use it.
+     * Uses the legacy gpio_request() API with the global GPIO number
+     * (obtained from the descriptor via desc_to_gpio()), because
+     * gpiod_request() is not exported to modules.
+     * Without this, gpiod_direction_output/input may fail with
+     * -EACCES on kernels with enforced request-before-use. */
+    ret = gpio_request(desc_to_gpio(desc), "dht");
+    if (ret) {
+        pin_err(pin, "GPIO request failed (already in use?): %d\n", ret);
+        return -EBUSY;
+    }
+
     /* Log which GPIO chip the pin was found on (for diagnostics) */
     chip = gpiod_to_chip(desc);
     if (chip && chip->label)
@@ -1634,9 +1672,12 @@ static int dht_do_register(int pin, int interval)
 
     /* Allocate and initialize the sensor struct */
     sensor = kzalloc(sizeof(*sensor), GFP_KERNEL);
-    if (!sensor)
+    if (!sensor) {
+        gpio_free(desc_to_gpio(desc));
         return -ENOMEM;
+    }
 
+    sensor->gpiod = desc;               /* Store for gpio_free in release */
     sensor->pin = pin;
     sensor->interval = interval;                         /* Use provided interval (-1 = disabled) */
     sensor->status_code = ERR_SUCCESS;
