@@ -8,7 +8,9 @@
  *
  * Copyright (c) 2026, Chapvic
  *
- * Version: 2.8.4
+ * Version: 2.8.5
+ *
+ * License: GPLv3
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -99,7 +101,7 @@
 /* Driver metadata constants used in MODULE_* macros and dmesg output */
 #define DHT_DRIVER_AUTHOR        "DHT Driver (c) 2026, Chapvic"
 #define DHT_DRIVER_DESCRIPTION   "DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver"
-#define DHT_DRIVER_VERSION       "2.8.4"
+#define DHT_DRIVER_VERSION       "2.8.5"
 #define DHT_DRIVER_LICENSE       "GPL"
 
 MODULE_LICENSE(DHT_DRIVER_LICENSE);
@@ -646,9 +648,6 @@ static void dht_do_measurement(struct dht_sensor *sensor, bool manual)
         }
     }
 
-    /* Record the attempt timestamp for rate limiting */
-    sensor->last_attempt_time = ktime_get_real_seconds();
-
     /* Atomically claim the measuring flag to prevent parallel bit-bang
      * on the same GPIO line (e.g., manual measure vs auto-poll). */
     if (atomic_cmpxchg(&sensor->measuring, 0, 1)) {
@@ -664,6 +663,12 @@ static void dht_do_measurement(struct dht_sensor *sensor, bool manual)
         mutex_unlock(&sensor->lock);
         return;
     }
+
+    /* Record the attempt timestamp for rate limiting.
+     * Only update when we have claimed the measuring flag and are
+     * about to perform a real read. Skipped attempts (rate-limited
+     * or already-in-progress) do not affect the next rate-limit check. */
+    sensor->last_attempt_time = ktime_get_real_seconds();
 
     /* Release the lock during the actual sensor read to avoid blocking.
      * The read takes 20+ ms, which is too long to hold a mutex. */
@@ -1951,9 +1956,14 @@ static bool dht_proc_dir_is_empty(const char *path)
         return false;
     }
 
-    /* Iterate over directory entries */
+    /* Iterate over directory entries.
+     * If iterate_dir returns an error, treat the directory as
+     * non-empty (conservative) to avoid accidental removal. */
     dctx.ctx.pos = 0;
-    iterate_dir(filp, &dctx.ctx);
+    if (iterate_dir(filp, &dctx.ctx) < 0) {
+        filp_close(filp, NULL);
+        return false;
+    }
 
     empty = (dctx.count == 0);
     filp_close(filp, NULL);

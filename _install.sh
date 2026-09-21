@@ -1,4 +1,4 @@
 #!/bin/bash
 
-./_uninstall
+./_uninstall.sh
 sudo make install && sudo modprobe dht

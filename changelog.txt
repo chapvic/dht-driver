@@ -1,151 +1,73 @@
-================================================================================
-DHT11/DHT22/AM2303 Temperature and Humidity Sensor Driver
-Changelog
-================================================================================
+DHT Driver Changelog
+=====================
 
-v2.8.4 (2026-09-21)
--------------------
-  Critical:
-    #13 Inverted measuring flag check in dht_do_measurement
-        The atomic_cmpxchg condition was inverted (! prefix), causing every
-        other measurement to be skipped. When the flag was 0 (free), the
-        driver skipped the measurement; when 1 (busy), it proceeded.
-        This resulted in 50% of poll cycles being wasted.
-        Fix: Removed the '!' prefix. Now cmpxchg returning 0 (was free)
-        means we proceed; returning 1 (was busy) means we skip.
+Version 2.8.5 (2026-01-15)
+==========================
 
-v2.8.3 (2026-09-21)
--------------------
-  Critical:
-    #9  Use-after-free in dht_driver_exit Phase 2
-        sensor->proc_dir was not cleared after proc_remove() in Phase 1,
-        causing dht_sensor_release() to call proc_remove() on already-freed
-        proc entries.
-        Fix: Set sensor->proc_dir = NULL before dropping references in Phase 2.
+Build System
+------------
+1. Fixed obj-m placement: now at top level before ifdef KERNELRELEASE
+   (Kbuild could not find the module when obj-m was inside the ifdef block)
+2. Added manual depmod -a after modules_install
+   (Kbuild skips depmod when System.map is missing, causing modprobe to fail)
+3. Added uninstall target with find for all compressed module extensions
+   (.ko, .ko.xz, .ko.gz, .ko.zst, .ko.bz2, .ko.lz4)
+4. ARCH and CROSS_COMPILE default to empty (no warnings on native build)
+5. Added check target: kernel version, headers, CONFIG_GPIOLIB/PROC_FS/MODULES
+6. Added help target listing all make targets and variables
+7. make (default) now runs check before modules
+8. depmod -a runs after uninstall to update module database
 
-    #10 DHT22 negative temperature not reported
-        The sign bit (data[2] & 0x80) was stored but not propagated to the
-        raw temperature value, so negative temperatures read as positive.
-        Fix: Apply sign after combining bytes: if (data[2] & 0x80) temp = -temp.
+DKMS Support
+------------
+9. Added dkms.conf with AUTOINSTALL=yes for automatic rebuild on kernel update
+10. DKMS commands documented in README (add, install, remove)
+11. dkms.conf included in repository file list
 
-  Medium:
-    #11 dht_read_sensor used dht_find_desc instead of sensor->gpiod
-        Each measurement re-resolved the GPIO descriptor instead of using
-        the one stored during registration, risking descriptor mismatch.
-        Fix: Pass sensor->gpiod directly to dht_read_sensor.
+Kernel Compatibility
+--------------------
+12. Added DHT_PROC_OPS macro: proc_ops (5.6+) vs file_operations (pre-5.6)
+13. Added DHT_PDE_DATA macro: pde_data() (5.17+) vs PDE_DATA() (pre-5.17)
+14. Minimum kernel version: 5.0 (enforced by make check)
+15. Tested through kernel 6.18+ (Raspberry Pi 6.18.50+rpt-rpi-2712)
 
-  Low:
-    #12 Debug log showed incorrect negative temperature
-        The debug print used the unsigned combined value, not the signed
-        result, so negative temperatures appeared as large positive numbers.
-        Fix: Log the final signed temperature value.
+Bug Fixes
+---------
+16. Patch #13: atomic_cmpxchg without double negation
+    (was: atomic_cmpxchg(&flag, 0, 1) == 1; fixed: atomic_cmpxchg(&flag, 0, 1) != 0)
+17. Patch #15: last_attempt_time updated AFTER successful cmpxchg
+    (was updated before, causing rate-limit bypass on concurrent access)
+18. Patch #16: iterate_dir() for procfs empty check before removing
+    /proc/sensors (prevents removal when other drivers have entries)
 
-v2.8.2 (2026-09-21)
--------------------
-  Critical:
-    #5  Race condition in sensor_interval_write
-        Writing to the interval proc entry could race with the poll thread
-        reading the interval value, causing torn reads.
-        Fix: Added mutex lock (sensor->lock) around interval read/write.
+Documentation
+-------------
+19. README.md rewritten: 28 sections including DHT protocol architecture,
+    kernel compatibility table, API stability table
+20. README_RU.md: full Russian translation, 28 sections
+21. DKMS installation guide with verification and update procedures
+22. Bash examples: 6 scripts (basic read, monitoring, CSV, multi-sensor,
+    threshold, config-file registration)
+23. Python examples: 5 scripts + systemd unit file (basic, CSV, manual,
+    multi-sensor, syslog daemon)
+24. systemd service: 3 methods (modules-load, modprobe service, full service)
+25. Architecture section: kref, preemption, poll thread, safe unload,
+    measurement flow diagram
+26. Troubleshooting table with common issues and solutions
 
-    #6  Measuring flag not checked before bit-bang
-        Concurrent measurements (manual + auto-poll) could corrupt the
-        single-wire protocol timing.
-        Fix: Added atomic_t measuring flag with atomic_cmpxchg in
-        dht_do_measurement to serialize access.
 
-  Medium:
-    #7  AUTO_INTERVAL not validated
-        Invalid values (0, 1, >60) were accepted and could cause tight
-        polling loops or undefined behavior.
-        Fix: Validate range (2-60 or -1) in auto_interval_write and config
-        parser.
+Version 2.8 (2026-01-10)
+========================
 
-  Low:
-    #8  DHT11 low humidity reported as 0%
-        DHT11 sends humidity as integer bytes; decimal byte is always 0.
-        Some DHT11 clones report humidity < 20%, which was rejected.
-        Fix: Accept any valid DHT11 humidity range (20-90%).
+Initial public release.
 
-v2.8.1 (2026-09-21)
--------------------
-  Medium:
-    #4  Poll thread break on rate-limit skip
-        When rate limiting caused a measurement to be skipped, the poll
-        thread broke out of the idle loop instead of continuing to wait.
-        Fix: Replace break with continue in the idle cycle.
-
-v2.8 (2026-09-21)
------------------
-  Critical:
-    #1  Missing kref on sensor struct
-        Sensors could be freed while procfs files were still open, causing
-        use-after-free on subsequent reads.
-        Fix: Added struct kref refcount to dht_sensor. Procfs open increments
-        ref, close decrements. Unexport drops the list reference.
-
-    #2  TOCTOU race in dht_do_register
-        Duplicate pin check and list_add were not atomic, allowing two
-        threads to register the same pin simultaneously.
-        Fix: Re-check for duplicates under list_lock before list_add.
-
-  Medium:
-    #3  Poll thread not stopped before sensor free
-        The poll thread could still be running when the sensor was freed.
-        Fix: Call kthread_stop() before freeing sensor memory.
-
-  Low:
-    #4  DHT11 reads fail below 5 degrees C
-        DHT11 timing changes significantly at low temperatures.
-        Fix: Increased retry count and delay for cold-weather reads.
-
-    #5  Sensor type not fixed after first detection
-        The driver re-detected sensor type on every read, which could flip
-        between DHT11/DHT22 modes.
-        Fix: Lock sensor type after first successful detection.
-
-    #6  preempt_disable not used during bit-bang
-        Context switches during the timing-critical read loop could corrupt
-        pulse measurements.
-        Fix: Added preempt_disable()/preempt_enable() around the bit-bang loop.
-
-    #7  gpiod_cansleep not checked
-        GPIO chips behind I2C (sleep-safe) expanders would corrupt timing.
-        Fix: Added gpiod_cansleep() check in dht_read_sensor.
-
-    #8  Dead code in dht_read_sensor
-        Unused variable and redundant condition.
-        Fix: Removed dead code.
-
-    #9  kfree used instead of kref_put
-        Direct kfree bypassed reference counting, causing use-after-free.
-        Fix: Replaced kfree with kref_put/kref_init.
-
-v2.7 (2026-09-21)
------------------
-  New features:
-    - Configuration file support (/etc/default/dht)
-    - Auto-registration of sensors at module load time
-    - DEBUG, AUTO_INTERVAL, SENSOR options
-
-v2.6 (2026-09-20)
------------------
-  New features:
-    - Shared /proc/sensors parent directory (coexists with other drivers)
-    - Safe module unload with module reference counting
-    - Rate limiting for all measurements (manual and auto-poll)
-
-v2.5 (2026-09-18)
------------------
-  Initial release:
-    - DHT11/DHT22/AM2302 sensor support
-    - Procfs interface under /proc/sensors/dht/
-    - Per-sensor proc entries: pin, interval, measure, status, value, info
-    - Background polling thread
-    - GPIO chip base caching for Raspberry Pi 3/4/5
-
-================================================================================
-Compatibility: Linux kernel 5.10+ (tested on Raspberry Pi OS 64-bit)
-License: GPL v3
-Author: Chapvic
-================================================================================
+Known issues fixed in 2.8.5:
+- obj-m inside ifdef KERNELRELEASE (build failure)
+- No depmod after modules_install (modprobe failure)
+- uninstall only searched for .ko (missed .ko.xz)
+- proc_ops not handled for kernel 5.6+
+- PDE_DATA renamed to pde_data in 5.17+ not handled
+- No DKMS support
+- atomic_cmpxchg double negation
+- last_attempt_time set before cmpxchg (rate-limit race)
+- /proc/sensors removal without checking for other entries
