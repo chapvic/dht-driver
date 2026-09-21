@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2026, Chapvic
  *
- * Version: 2.8.1 (critical patch)
+ * Version: 2.8.2
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -99,7 +99,7 @@
 /* Driver metadata constants used in MODULE_* macros and dmesg output */
 #define DHT_DRIVER_AUTHOR        "DHT Driver © 2026, Chapvic"
 #define DHT_DRIVER_DESCRIPTION   "DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver"
-#define DHT_DRIVER_VERSION       "2.8.1"
+#define DHT_DRIVER_VERSION       "2.8.2"
 #define DHT_DRIVER_LICENSE       "GPL"
 
 MODULE_LICENSE(DHT_DRIVER_LICENSE);
@@ -245,6 +245,7 @@ struct dht_sensor {
     struct proc_dir_entry *proc_dir;  /* Pointer to the sensor's procfs subdirectory (/proc/sensors/dht/gpio<pin>/) */
     struct task_struct *poll_thread;  /* Kernel thread for background polling (NULL if not running) */
     struct gpio_desc *gpiod;          /* Requested GPIO descriptor (owned by this sensor) */
+    atomic_t measuring;               /* Atomic flag: 1 = measurement in progress (prevents parallel bit-bang) */
     struct kref refcount;              /* Reference count: prevents use-after-free during unexport */
     struct list_head list;            /* Linked list node for the global sensor list */
 };
@@ -534,6 +535,16 @@ static int dht_read_sensor(int pin, int *hum, int *temp, int *type)
                 /* DHT11: use only the integer bytes, scale by 10 for consistent units */
                 h = data[0] * 10;
                 c = data[2] * 10;
+            } else if (data[1] == 0 && data[3] == 0 &&
+                       data[0] <= 100 && data[2] <= 50) {
+                /* Edge case: DHT11 with low humidity (<= 3%) produces
+                 * h <= 1000, which would be misidentified as DHT22.
+                 * Additional checks: fractional bytes are 0 (DHT11 never
+                 * sends fractional data) and values are within DHT11
+                 * ranges (humidity 0-100%, temperature 0-50 C). */
+                if (type) *type = SENSOR_TYPE_DHT11;
+                h = data[0] * 10;
+                c = data[2] * 10;
             } else {
                 if (type) *type = SENSOR_TYPE_DHT22;
                 /* DHT22: the 16-bit values are already scaled x10 */
@@ -632,12 +643,31 @@ static void dht_do_measurement(struct dht_sensor *sensor, bool manual)
     /* Record the attempt timestamp for rate limiting */
     sensor->last_attempt_time = ktime_get_real_seconds();
 
+    /* Atomically claim the measuring flag to prevent parallel bit-bang
+     * on the same GPIO line (e.g., manual measure vs auto-poll). */
+    if (!atomic_cmpxchg(&sensor->measuring, 0, 1)) {
+        /* Another measurement is already in progress */
+        if (manual) {
+            sensor->status_code = ERR_READ_FAILED;
+            snprintf(sensor->status_text, STATUS_BUF_LEN,
+                     "Measurement already in progress");
+            pin_dbg(sensor->pin, "manual measurement skipped - already in progress\n");
+        } else {
+            pin_dbg(sensor->pin, "auto-poll skipped - measurement in progress\n");
+        }
+        mutex_unlock(&sensor->lock);
+        return;
+    }
+
     /* Release the lock during the actual sensor read to avoid blocking.
      * The read takes 20+ ms, which is too long to hold a mutex. */
     mutex_unlock(&sensor->lock);
 
     /* Perform the actual GPIO read (may take multiple retries) */
     ret = dht_read_sensor(sensor->pin, &hum, &temp, &type);
+
+    /* Release the measuring flag */
+    atomic_set(&sensor->measuring, 0);
 
     /* Re-acquire the lock to store the results */
     mutex_lock(&sensor->lock);
@@ -709,11 +739,12 @@ static int dht_poll_thread_fn(void *data)
          * thread was started by a previous non-zero global setting. */
         if (effective_interval == -1) {
             pin_dbg(sensor->pin, "both intervals disabled, poll thread idle\n");
-            /* Sleep in 1-second increments until asked to stop
-             * or an interval gets re-enabled by the user.
-             * Do NOT break out of the main loop — if the thread
-             * exits on its own, task_struct is freed but
-             * sensor->poll_thread becomes a dangling pointer. */
+            /* Do NOT break out of the main loop here! If the thread exits
+             * on its own, task_struct is freed by the kernel but
+             * sensor->poll_thread still holds a dangling pointer.
+             * A later dht_stop_poll() -> kthread_stop() would be a
+             * use-after-free. Instead, sleep in a loop until
+             * kthread_should_stop() or until an interval is re-enabled. */
             while (!kthread_should_stop()) {
                 mutex_lock(&sensor->lock);
                 if (READ_ONCE(global_auto_interval) != -1 ||
@@ -724,7 +755,7 @@ static int dht_poll_thread_fn(void *data)
                 mutex_unlock(&sensor->lock);
                 ssleep(1);
             }
-            continue;  /* re-check kthread_should_stop in main loop */
+            continue;  /* re-enter main loop, re-check kthread_should_stop */
         }
 
         /* Safety fallback: ensure a minimum interval */
@@ -1137,11 +1168,15 @@ static ssize_t auto_interval_write(struct file *f, const char __user *buf, size_
     /* Acquire the list lock to safely modify global state and sensor list */
     mutex_lock(&list_lock);
 
-    /* Set the global interval or disable it if the value is out of range */
-    if (val >= MIN_INTERVAL && val <= MAX_INTERVAL) {
+    /* Set the global interval; -1 disables; out-of-range is rejected */
+    if (val == -1) {
+        WRITE_ONCE(global_auto_interval, -1);
+    } else if (val >= MIN_INTERVAL && val <= MAX_INTERVAL) {
         WRITE_ONCE(global_auto_interval, val);
     } else {
-        WRITE_ONCE(global_auto_interval, -1);
+        mutex_unlock(&list_lock);
+        dht_err("auto_interval: invalid value %d (must be 2-60 or -1)\n", val);
+        return -EINVAL;
     }
 
     /* If global auto mode is now active, start poll threads for all sensors
@@ -1314,7 +1349,10 @@ static ssize_t sensor_interval_write(struct file *f, const char __user *buf, siz
         return count;
     }
 
-    /* Global auto mode is off — the per-sensor setting controls polling */
+    /* Global auto mode is off — the per-sensor setting controls polling.
+     * Hold list_lock to prevent races with concurrent dht_start_poll/
+     * dht_stop_poll from other paths (auto_interval_write, dht_do_register). */
+    mutex_lock(&list_lock);
     if (val == -1) {
         /* Disable polling: stop the thread if running */
         dht_stop_poll(sensor);
@@ -1324,6 +1362,7 @@ static ssize_t sensor_interval_write(struct file *f, const char __user *buf, siz
         dht_start_poll(sensor);
         pin_log(sensor->pin, "auto-poll enabled (interval=%d)\n", val);
     }
+    mutex_unlock(&list_lock);
     return count;
 }
 
@@ -1579,9 +1618,7 @@ static int dht_create_sensor_proc(struct dht_sensor *sensor)
     for (i = 0; i < ARRAY_SIZE(sensor_proc_entries); i++) {
         const struct proc_entry_def *e = &sensor_proc_entries[i];
         if (!proc_create_data(e->name, e->mode, sensor->proc_dir, e->fops, sensor)) {
-            /* If any entry fails, clean up the entire directory.
-             * Must NULL the pointer so dht_sensor_release() won't
-             * call proc_remove() again on the already-freed entry. */
+            /* If any entry fails, clean up the entire directory */
             proc_remove(sensor->proc_dir);
             sensor->proc_dir = NULL;
             return -ENOMEM;
@@ -1651,9 +1688,6 @@ static int dht_do_register(int pin, int interval)
     }
 
     /* Request (claim) the GPIO line so no other driver can use it.
-     * Uses the legacy gpio_request() API with the global GPIO number
-     * (obtained from the descriptor via desc_to_gpio()), because
-     * gpiod_request() is not exported to modules.
      * Without this, gpiod_direction_output/input may fail with
      * -EACCES on kernels with enforced request-before-use. */
     ret = gpio_request(desc_to_gpio(desc), "dht");
@@ -1678,6 +1712,7 @@ static int dht_do_register(int pin, int interval)
     }
 
     sensor->gpiod = desc;               /* Store for gpio_free in release */
+    atomic_set(&sensor->measuring, 0);
     sensor->pin = pin;
     sensor->interval = interval;                         /* Use provided interval (-1 = disabled) */
     sensor->status_code = ERR_SUCCESS;
