@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2026, Chapvic
  *
- * Version: 2.8.3
+ * Version: 2.8.4
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -97,9 +97,9 @@
 #include <linux/preempt.h>
 
 /* Driver metadata constants used in MODULE_* macros and dmesg output */
-#define DHT_DRIVER_AUTHOR        "DHT Driver © 2026, Chapvic"
+#define DHT_DRIVER_AUTHOR        "DHT Driver (c) 2026, Chapvic"
 #define DHT_DRIVER_DESCRIPTION   "DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver"
-#define DHT_DRIVER_VERSION       "2.8.3"
+#define DHT_DRIVER_VERSION       "2.8.4"
 #define DHT_DRIVER_LICENSE       "GPL"
 
 MODULE_LICENSE(DHT_DRIVER_LICENSE);
@@ -107,7 +107,7 @@ MODULE_AUTHOR(DHT_DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DHT_DRIVER_DESCRIPTION);
 MODULE_VERSION(DHT_DRIVER_VERSION);
 
-/* ── Timing and protocol constants ────────────────────────── */
+/* -- Timing and protocol constants -------------------------- */
 
 #define MAX_TIMINGS      100        /* Maximum number of pulse transitions to capture in one read cycle */
 #define PROC_PARENT      "sensors"  /* Parent procfs directory name (/proc/sensors) */
@@ -127,7 +127,7 @@ MODULE_VERSION(DHT_DRIVER_VERSION);
 #define CONFIG_BUF_LEN   4096               /* Maximum size of the configuration file buffer */
 #define CONFIG_LINE_LEN  256                /* Maximum length of a single config line */
 
-/* ── Error code definitions ───────────────────────────────── */
+/* -- Error code definitions --------------------------------- */
 
 #define ERR_SUCCESS       0    /* Operation completed successfully */
 #define ERR_PIN_INVALID   1    /* The specified GPIO pin number is out of valid range */
@@ -136,13 +136,13 @@ MODULE_VERSION(DHT_DRIVER_VERSION);
 #define ERR_AUTO_MODE     4    /* Manual measurement attempted while auto-poll is active */
 #define ERR_TOO_SOON      5    /* Manual measurement rejected due to rate limiting */
 
-/* ── Sensor type identifiers ──────────────────────────────── */
+/* -- Sensor type identifiers -------------------------------- */
 
 #define SENSOR_TYPE_UNKNOWN  0   /* Sensor type not yet determined (no successful measurement) */
 #define SENSOR_TYPE_DHT11    1   /* DHT11 sensor: integer humidity/temperature, lower resolution */
 #define SENSOR_TYPE_DHT22    2   /* DHT22/AM2302 sensor: decimal humidity/temperature, higher resolution */
 
-/* ── Kernel API compatibility macros ─────────────────────── */
+/* -- Kernel API compatibility macros ----------------------- */
 
 /*
  * Starting with kernel 5.6, procfs uses struct proc_ops instead of
@@ -178,7 +178,7 @@ static int dht_debug = 0;
 module_param(dht_debug, int, 0644);
 MODULE_PARM_DESC(dht_debug, "Debug logging (0 = off, 1 = on)");
 
-/* ── Logging macros ─────────────────────────────────────────── */
+/* -- Logging macros ------------------------------------------- */
 
 /*
  * The following macros provide three levels of logging:
@@ -196,7 +196,7 @@ MODULE_PARM_DESC(dht_debug, "Debug logging (0 = off, 1 = on)");
 #define pin_err(p, fmt, ...) printk(KERN_ERR   "[dht_gpio_%d]: " fmt, p, ##__VA_ARGS__)
 #define pin_dbg(p, fmt, ...) do { if (READ_ONCE(dht_debug)) printk(KERN_INFO "[dht_gpio_%d]: " fmt, p, ##__VA_ARGS__); } while (0)
 
-/* ── Time helper ───────────────────────────────────────────── */
+/* -- Time helper --------------------------------------------- */
 
 /**
  * dht_format_iso_time - Convert a Unix timestamp to ISO 8601 string format
@@ -221,7 +221,7 @@ static void dht_format_iso_time(time64_t seconds, char *buf, size_t size)
              tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
-/* ── Per-sensor state ──────────────────────────────────────── */
+/* -- Per-sensor state ---------------------------------------- */
 
 /*
  * struct dht_sensor - Represents one registered DHT sensor
@@ -250,7 +250,7 @@ struct dht_sensor {
     struct list_head list;            /* Linked list node for the global sensor list */
 };
 
-/* ── Global state ──────────────────────────────────────────── */
+/* -- Global state -------------------------------------------- */
 
 /*
  * Global variables shared across all sensor instances.
@@ -269,7 +269,7 @@ static int global_auto_interval = -1;        /* Global auto-poll interval in sec
 static int cached_chip_base = -1;            /* Cached base GPIO number of the detected Pi GPIO chip. -1 = not yet detected */
 static atomic_t dht_exiting = ATOMIC_INIT(0); /* Flag set during module unload to reject new procfs operations */
 
-/* ── Error text ────────────────────────────────────────────── */
+/* -- Error text ---------------------------------------------- */
 
 /**
  * error_str - Return a human-readable description for an error code
@@ -292,7 +292,7 @@ static const char *error_str(int code)
     }
 }
 
-/* ── GPIO chip detection ──────────────────────────────────── */
+/* -- GPIO chip detection ------------------------------------ */
 
 /**
  * is_pi_gpio_chip - Check whether a GPIO chip label belongs to a Raspberry Pi
@@ -328,7 +328,7 @@ static bool is_pi_gpio_chip(const char *label)
  *
  * The function uses a three-stage lookup strategy:
  *   1. Fast path: if cached_chip_base is known, compute global = base + bcm_pin
- *   2. Direct lookup: try gpio_to_desc(bcm_pin) — works on Pi 3/4 where base=0
+ *   2. Direct lookup: try gpio_to_desc(bcm_pin) -- works on Pi 3/4 where base=0
  *   3. Full scan: iterate over all GPIO numbers 0..2048 looking for a Pi chip
  *      where the local offset matches the requested BCM pin
  *
@@ -351,7 +351,7 @@ static struct gpio_desc *dht_find_desc(int bcm_pin)
             return desc;
     }
 
-    /* Stage 2: Direct lookup — works on Pi 3/4 where GPIO base = 0.
+    /* Stage 2: Direct lookup -- works on Pi 3/4 where GPIO base = 0.
      * The BCM pin number equals the global GPIO number. */
     desc = gpio_to_desc(bcm_pin);
     if (desc) {
@@ -364,7 +364,7 @@ static struct gpio_desc *dht_find_desc(int bcm_pin)
         }
     }
 
-    /* Stage 3: Full scan — needed on Pi 5 where GPIO base is large (e.g., 512).
+    /* Stage 3: Full scan -- needed on Pi 5 where GPIO base is large (e.g., 512).
      * Iterate over all possible global GPIO numbers to find the Pi chip
      * whose local offset matches the requested BCM pin. */
     for (i = 0; i <= 2048; i++) {
@@ -391,7 +391,7 @@ static struct gpio_desc *dht_find_desc(int bcm_pin)
     return NULL;
 }
 
-/* ── Sensor read ───────────────────────────────────────────── */
+/* -- Sensor read --------------------------------------------- */
 
 /**
  * dht_read_sensor - Read temperature and humidity from a DHT sensor
@@ -437,7 +437,7 @@ static int dht_read_sensor(int pin, struct gpio_desc *desc, int *hum, int *temp,
      * chip). The bit-bang timing loop uses non-sleeping gpiod_get_value
      * in a tight loop and will not work correctly with sleeping GPIOs. */
     if (gpiod_cansleep(desc)) {
-        pin_err(pin, "GPIO is on a sleeping chip — timing-critical reads will not work\n");
+        pin_err(pin, "GPIO is on a sleeping chip -- timing-critical reads will not work\n");
         return ERR_GPIO_REQUEST;
     }
 
@@ -448,7 +448,7 @@ static int dht_read_sensor(int pin, struct gpio_desc *desc, int *hum, int *temp,
         last_state = 1;
         j = 0;
 
-        /* Step 1: Send start signal — pull the data line low for 20 ms */
+        /* Step 1: Send start signal -- pull the data line low for 20 ms */
         if (gpiod_direction_output(desc, 0)) {
             pin_err(pin, "failed to set GPIO output\n");
             return ERR_GPIO_REQUEST;
@@ -457,7 +457,7 @@ static int dht_read_sensor(int pin, struct gpio_desc *desc, int *hum, int *temp,
         gpiod_set_value(desc, 0);
         msleep(20);
 
-        /* Step 2: Release the line — switch to input mode.
+        /* Step 2: Release the line -- switch to input mode.
          * The pull-up resistor on the data line brings it high.
          * The sensor will respond after 20-40 us. */
         if (gpiod_direction_input(desc)) {
@@ -554,8 +554,8 @@ static int dht_read_sensor(int pin, struct gpio_desc *desc, int *hum, int *temp,
             /* Handle negative temperature (bit 7 of data[2] is the sign bit).
              * For DHT22: c = (data[2] << 8) | data[3], so bit 15 is the sign.
              * Mask the sign bit before negating to get the correct magnitude:
-             *   c = 0x80FB → -(0x00FB) = -251 → T=-25.1 C (correct)
-             * Without the mask: -(0x80FB) = -32763 → wrong magnitude.
+             *   c = 0x80FB -> -(0x00FB) = -251 -> T=-25.1 C (correct)
+             * Without the mask: -(0x80FB) = -32763 -> wrong magnitude.
              * For DHT11: data[2] is 0-50, bit 7 is never set, no effect. */
             if (data[2] & 0x80)
                 c = -(c & 0x7FFF);
@@ -580,7 +580,7 @@ static int dht_read_sensor(int pin, struct gpio_desc *desc, int *hum, int *temp,
     return ERR_READ_FAILED;
 }
 
-/* ── Measurement ───────────────────────────────────────────── */
+/* -- Measurement --------------------------------------------- */
 
 /**
  * dht_do_measurement - Perform a single sensor measurement and store results
@@ -651,7 +651,7 @@ static void dht_do_measurement(struct dht_sensor *sensor, bool manual)
 
     /* Atomically claim the measuring flag to prevent parallel bit-bang
      * on the same GPIO line (e.g., manual measure vs auto-poll). */
-    if (!atomic_cmpxchg(&sensor->measuring, 0, 1)) {
+    if (atomic_cmpxchg(&sensor->measuring, 0, 1)) {
         /* Another measurement is already in progress */
         if (manual) {
             sensor->status_code = ERR_READ_FAILED;
@@ -684,7 +684,7 @@ static void dht_do_measurement(struct dht_sensor *sensor, bool manual)
 
     if (ret == ERR_SUCCESS) {
         /* Update measurement results on success.
-         * Sensor type is determined once and then locked — it does not
+         * Sensor type is determined once and then locked -- it does not
          * change between measurements. This prevents spurious type flips
          * caused by borderline humidity readings (e.g., DHT22 reporting
          * 100.1% could briefly trigger the DHT11 heuristic). */
@@ -706,7 +706,7 @@ static void dht_do_measurement(struct dht_sensor *sensor, bool manual)
     mutex_unlock(&sensor->lock);
 }
 
-/* ── Poll thread ───────────────────────────────────────────── */
+/* -- Poll thread --------------------------------------------- */
 
 /**
  * dht_poll_thread_fn - Background polling thread function
@@ -730,7 +730,7 @@ static int dht_poll_thread_fn(void *data)
 
     pin_dbg(sensor->pin, "poll thread started\n");
 
-    /* Main polling loop — runs until the thread is asked to stop */
+    /* Main polling loop -- runs until the thread is asked to stop */
     while (!kthread_should_stop()) {
         int effective_interval;
 
@@ -746,7 +746,7 @@ static int dht_poll_thread_fn(void *data)
         mutex_unlock(&sensor->lock);
 
         /* If both global and per-sensor intervals are disabled (-1),
-         * the thread should stop — there is nothing to poll for.
+         * the thread should stop -- there is nothing to poll for.
          * This can happen when auto_interval is set to -1 while the
          * thread was started by a previous non-zero global setting. */
         if (effective_interval == -1) {
@@ -836,7 +836,7 @@ static void dht_stop_poll(struct dht_sensor *sensor)
     kthread_stop(thread);
 }
 
-/* ── Reference counting and unified sensor cleanup ─────────── */
+/* -- Reference counting and unified sensor cleanup ----------- */
 
 /**
  * dht_sensor_get - Acquire a reference to a sensor
@@ -859,7 +859,7 @@ static struct dht_sensor *dht_sensor_get(struct dht_sensor *sensor)
 }
 
 /**
- * dht_sensor_release - kref release callback — frees all sensor resources
+ * dht_sensor_release - kref release callback -- frees all sensor resources
  * @ref: Pointer to the kref embedded in struct dht_sensor
  *
  * Called when the last reference to the sensor is dropped. This performs
@@ -903,7 +903,7 @@ static void dht_sensor_put(struct dht_sensor *sensor)
  *   - dht_do_register() when initial measurement fails after registration
  *   - unexport_write() when the user unregisters a sensor
  *
- * Note: dht_driver_exit() does NOT call this function — it performs its own
+ * Note: dht_driver_exit() does NOT call this function -- it performs its own
  * two-phase cleanup that removes procfs entries before stopping threads,
  * to prevent race conditions during module unload.
  */
@@ -912,7 +912,7 @@ static void dht_sensor_free(struct dht_sensor *sensor)
     dht_sensor_put(sensor);
 }
 
-/* ── Input parsing helper ──────────────────────────────────── */
+/* -- Input parsing helper ------------------------------------ */
 
 /**
  * dht_parse_int - Parse an integer value from user-space input
@@ -943,7 +943,7 @@ static int dht_parse_int(const char __user *buf, size_t count, int *val)
     return kstrtoint(strim(in), 10, val) ? -EINVAL : 0;
 }
 
-/* ── Module reference counting for procfs ─────────────────── */
+/* -- Module reference counting for procfs ------------------- */
 
 /**
  * dht_proc_open - Generic open handler that increments the module reference count
@@ -1011,14 +1011,14 @@ static int dht_proc_release(struct inode *inode, struct file *f)
     return 0;
 }
 
-/* ── Global procfs: debug ───────────────────────────────────── */
+/* -- Global procfs: debug ------------------------------------- */
 
 /**
  * debug_read - Read the current debug flag value
- * @f:     File structure (unused — no per-file state)
+ * @f:     File structure (unused -- no per-file state)
  * @buf:   User-space buffer to write the result to
  * @count: Maximum number of bytes to write
- * @pos:   File offset — used to return 0 on subsequent reads (EOF)
+ * @pos:   File offset -- used to return 0 on subsequent reads (EOF)
  *
  * Outputs the current value of dht_debug (0 or 1) as a decimal string
  * followed by a newline. The *pos check ensures the output is only
@@ -1087,14 +1087,14 @@ static const DHT_PROC_OPS debug_fops = {
     DHT_PROC_RELEASE = dht_proc_release,
 };
 
-/* ── Global procfs: version ────────────────────────────────── */
+/* -- Global procfs: version ---------------------------------- */
 
 /**
  * version_read - Read the driver version string
  * @f:     File structure (unused)
  * @buf:   User-space buffer to write the version string to
  * @count: Maximum number of bytes to write
- * @pos:   File offset — used to return 0 on subsequent reads (EOF)
+ * @pos:   File offset -- used to return 0 on subsequent reads (EOF)
  *
  * Outputs the driver version (e.g., "2.7\n") to the user buffer.
  *
@@ -1123,14 +1123,14 @@ static const DHT_PROC_OPS version_fops = {
     DHT_PROC_RELEASE = dht_proc_release,
 };
 
-/* ── Global procfs: auto_interval ──────────────────────────── */
+/* -- Global procfs: auto_interval ---------------------------- */
 
 /**
  * auto_interval_read - Read the current global auto-poll interval
  * @f:     File structure (unused)
  * @buf:   User-space buffer to write the value to
  * @count: Maximum number of bytes to write
- * @pos:   File offset — used to return 0 on subsequent reads (EOF)
+ * @pos:   File offset -- used to return 0 on subsequent reads (EOF)
  *
  * Outputs the current global_auto_interval value (seconds, or -1 if disabled).
  *
@@ -1162,7 +1162,7 @@ static ssize_t auto_interval_read(struct file *f, char __user *buf, size_t count
  * When set to a valid interval (2-60 seconds), all registered sensors
  * start (or continue) background polling at this shared interval.
  * When set to -1 (or any out-of-range value), global auto-poll is
- * disabled. Existing poll threads are NOT stopped — per-sensor
+ * disabled. Existing poll threads are NOT stopped -- per-sensor
  * intervals take over if they are active.
  *
  * The function also starts poll threads for any registered sensors
@@ -1218,7 +1218,7 @@ static const DHT_PROC_OPS auto_interval_fops = {
     DHT_PROC_RELEASE = dht_proc_release,
 };
 
-/* ── Per-sensor procfs handlers ────────────────────────────── */
+/* -- Per-sensor procfs handlers ------------------------------ */
 
 /*
  * The following two macros generate read handler functions for
@@ -1226,8 +1226,8 @@ static const DHT_PROC_OPS auto_interval_fops = {
  * function reads the field under the sensor mutex and outputs it
  * as a decimal string.
  *
- * SENSOR_INT_READ(field) — generates sensor_<field>_read() for int fields
- * SENSOR_LL_READ(field)  — generates sensor_<field>_read() for time64_t fields
+ * SENSOR_INT_READ(field) -- generates sensor_<field>_read() for int fields
+ * SENSOR_LL_READ(field)  -- generates sensor_<field>_read() for time64_t fields
  *
  * Both use DHT_PDE_DATA to retrieve the sensor pointer from the
  * procfs inode, and both respect the *pos offset for sequential reads.
@@ -1280,18 +1280,18 @@ static ssize_t sensor_##field##_read(struct file *f, char __user *buf, size_t co
 }
 
 /* Generate read handlers for integer fields */
-SENSOR_INT_READ(pin)           /* sensor_pin_read() — outputs the BCM GPIO pin number */
-SENSOR_INT_READ(status_code)   /* sensor_status_code_read() — outputs the last measurement error code */
+SENSOR_INT_READ(pin)           /* sensor_pin_read() -- outputs the BCM GPIO pin number */
+SENSOR_INT_READ(status_code)   /* sensor_status_code_read() -- outputs the last measurement error code */
 
 /* Generate read handlers for 64-bit timestamp fields */
-SENSOR_LL_READ(last_meas_time) /* sensor_last_meas_time_read() — outputs Unix timestamp of last successful measurement */
+SENSOR_LL_READ(last_meas_time) /* sensor_last_meas_time_read() -- outputs Unix timestamp of last successful measurement */
 
 /**
  * sensor_interval_read - Read the per-sensor auto-poll interval
  * @f:     File structure (unused, sensor data comes from inode)
  * @buf:   User-space buffer to write the value to
  * @count: Maximum number of bytes to write
- * @pos:   File offset — used to return 0 on subsequent reads (EOF)
+ * @pos:   File offset -- used to return 0 on subsequent reads (EOF)
  *
  * Outputs the sensor's interval value (seconds, or -1 if disabled).
  * This is the per-sensor setting, which is overridden by global_auto_interval
@@ -1333,7 +1333,7 @@ static ssize_t sensor_interval_read(struct file *f, char __user *buf, size_t cou
  *
  * If global auto-poll is active, the per-sensor interval is stored but
  * not used for polling (the global interval takes priority). In that case,
- * the poll thread is not started or stopped — the global mode controls it.
+ * the poll thread is not started or stopped -- the global mode controls it.
  *
  * Returns: Number of bytes consumed on success, or a negative error code.
  */
@@ -1361,7 +1361,7 @@ static ssize_t sensor_interval_write(struct file *f, const char __user *buf, siz
         return count;
     }
 
-    /* Global auto mode is off — the per-sensor setting controls polling.
+    /* Global auto mode is off -- the per-sensor setting controls polling.
      * Hold list_lock to prevent races with concurrent dht_start_poll/
      * dht_stop_poll from other paths (auto_interval_write, dht_do_register). */
     mutex_lock(&list_lock);
@@ -1381,7 +1381,7 @@ static ssize_t sensor_interval_write(struct file *f, const char __user *buf, siz
 /**
  * sensor_measure_write - Trigger a manual measurement
  * @f:     File structure (unused, sensor data comes from inode)
- * @buf:   User-space buffer — must contain "1" to trigger
+ * @buf:   User-space buffer -- must contain "1" to trigger
  * @count: Number of bytes in the user buffer
  * @pos:   File offset (unused)
  *
@@ -1420,7 +1420,7 @@ static ssize_t sensor_measure_write(struct file *f, const char __user *buf, size
     }
     mutex_unlock(&sensor->lock);
 
-    /* Auto-poll is off — perform the manual measurement.
+    /* Auto-poll is off -- perform the manual measurement.
      * dht_do_measurement handles rate limiting internally. */
     dht_do_measurement(sensor, true);
     return count;
@@ -1431,7 +1431,7 @@ static ssize_t sensor_measure_write(struct file *f, const char __user *buf, size
  * @f:     File structure (unused, sensor data comes from inode)
  * @buf:   User-space buffer to write the status text to
  * @count: Maximum number of bytes to write
- * @pos:   File offset — used to return 0 on subsequent reads (EOF)
+ * @pos:   File offset -- used to return 0 on subsequent reads (EOF)
  *
  * Outputs the sensor's status_text field (e.g., "SUCCESS", "Sensor data read failed")
  * followed by a newline. This is the human-readable version of status_code.
@@ -1463,7 +1463,7 @@ static ssize_t sensor_status_text_read(struct file *f, char __user *buf, size_t 
  * @f:     File structure (unused, sensor data comes from inode)
  * @buf:   User-space buffer to write the formatted values to
  * @count: Maximum number of bytes to write
- * @pos:   File offset — used to return 0 on subsequent reads (EOF)
+ * @pos:   File offset -- used to return 0 on subsequent reads (EOF)
  *
  * Outputs the last measured values in the format:
  *   "H=<humidity>\nT=<temperature>\n"
@@ -1507,7 +1507,7 @@ static ssize_t sensor_value_read(struct file *f, char __user *buf, size_t count,
  * @f:     File structure (unused, sensor data comes from inode)
  * @buf:   User-space buffer to write the info text to
  * @count: Maximum number of bytes to write
- * @pos:   File offset — used to return 0 on subsequent reads (EOF)
+ * @pos:   File offset -- used to return 0 on subsequent reads (EOF)
  *
  * Outputs the sensor type (DHT11 or DHT22) and registration timestamp
  * in ISO 8601 format. If the sensor type has not been determined yet
@@ -1555,7 +1555,7 @@ static ssize_t sensor_info_read(struct file *f, char __user *buf, size_t count, 
     return len;
 }
 
-/* ── Per-sensor fops ───────────────────────────────────────── */
+/* -- Per-sensor fops ----------------------------------------- */
 
 /*
  * Each entry below binds a procfs file to its read/write handler functions.
@@ -1570,7 +1570,7 @@ static const DHT_PROC_OPS sensor_value_fops       = { DHT_PROC_OPEN = dht_proc_o
 static const DHT_PROC_OPS sensor_info_fops        = { DHT_PROC_OPEN = dht_proc_open, DHT_PROC_READ = sensor_info_read, DHT_PROC_RELEASE = dht_proc_release };
 static const DHT_PROC_OPS sensor_timestamp_fops   = { DHT_PROC_OPEN = dht_proc_open, DHT_PROC_READ = sensor_last_meas_time_read, DHT_PROC_RELEASE = dht_proc_release };
 
-/* ── Proc entry tables ────────────────────────────────────── */
+/* -- Proc entry tables -------------------------------------- */
 
 /*
  * struct proc_entry_def - Describes a procfs entry to be created
@@ -1600,7 +1600,7 @@ static const struct proc_entry_def sensor_proc_entries[] = {
     { "timestamp",   0444, &sensor_timestamp_fops },
 };
 
-/* ── Export / Unexport ────────────────────────────────────── */
+/* -- Export / Unexport -------------------------------------- */
 
 /**
  * dht_create_sensor_proc - Create the per-sensor procfs directory and entries
@@ -1757,7 +1757,7 @@ static int dht_do_register(int pin, int interval)
         return -EIO;
     }
 
-    /* Add the sensor to the global list — re-check for duplicates under
+    /* Add the sensor to the global list -- re-check for duplicates under
      * the lock to close the TOCTOU window between the initial check
      * and the list_add. */
     mutex_lock(&list_lock);
@@ -1835,7 +1835,7 @@ static ssize_t unexport_write(struct file *f, const char __user *buf, size_t cou
     mutex_lock(&list_lock);
     list_for_each_entry_safe(sensor, tmp, &sensor_list, list) {
         if (sensor->pin == pin) {
-            /* Found the sensor — remove it from the list */
+            /* Found the sensor -- remove it from the list */
             list_del(&sensor->list);
             sensor_count--;
             mutex_unlock(&list_lock);
@@ -1870,7 +1870,7 @@ static const DHT_PROC_OPS unexport_fops = {
     DHT_PROC_RELEASE = dht_proc_release,
 };
 
-/* ── Proc directory emptiness check ─────────────────────── */
+/* -- Proc directory emptiness check ----------------------- */
 
 /*
  * struct dht_dir_ctx - Context for directory iteration callback
@@ -1900,7 +1900,7 @@ struct dht_dir_ctx {
  * (we only need to know if the directory is non-empty, not list everything).
  *
  * Returns: true to continue iteration (entry was . or ..), false to stop
- *          (found a real entry — directory is not empty).
+ *          (found a real entry -- directory is not empty).
  */
 static bool dht_dir_filldir(struct dir_context *ctx, const char *name,
                             int namlen, loff_t pos, u64 ino,
@@ -1910,11 +1910,11 @@ static bool dht_dir_filldir(struct dir_context *ctx, const char *name,
 
     dctx = container_of(ctx, struct dht_dir_ctx, ctx);
 
-    /* Skip "." and ".." — they are not real subdirectories */
+    /* Skip "." and ".." -- they are not real subdirectories */
     if (name[0] == '.' && (namlen == 1 || (namlen == 2 && name[1] == '.')))
         return true;
 
-    /* Found a real entry — increment count and stop iteration */
+    /* Found a real entry -- increment count and stop iteration */
     dctx->count++;
     return false;
 }
@@ -1946,7 +1946,7 @@ static bool dht_proc_dir_is_empty(const char *path)
 
     filp = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
     if (IS_ERR(filp)) {
-        /* Could not open — conservatively assume not empty */
+        /* Could not open -- conservatively assume not empty */
         dht_err("could not open %s for emptiness check\n", path);
         return false;
     }
@@ -1961,7 +1961,7 @@ static bool dht_proc_dir_is_empty(const char *path)
     return empty;
 }
 
-/* ── Configuration file parser ────────────────────────────── */
+/* -- Configuration file parser ------------------------------ */
 
 /**
  * dht_config_set_auto_interval - Set global auto-poll interval from config
@@ -1998,11 +1998,11 @@ static void dht_config_set_auto_interval(int val)
  * @line: Null-terminated, trimmed config line (no leading/trailing whitespace)
  *
  * Supported options:
- *   DEBUG               — enable debug logging (equivalent to DEBUG=1)
- *   DEBUG=0|1           — explicitly set debug flag
- *   AUTO_INTERVAL=N    — set global auto-poll interval (2-60, or -1 to disable)
- *   SENSOR=pin          — register a sensor on the given BCM pin (no auto-poll)
- *   SENSOR=pin,N        — register a sensor with per-sensor auto-poll interval
+ *   DEBUG               -- enable debug logging (equivalent to DEBUG=1)
+ *   DEBUG=0|1           -- explicitly set debug flag
+ *   AUTO_INTERVAL=N    -- set global auto-poll interval (2-60, or -1 to disable)
+ *   SENSOR=pin          -- register a sensor on the given BCM pin (no auto-poll)
+ *   SENSOR=pin,N        -- register a sensor with per-sensor auto-poll interval
  *
  * Invalid option names and invalid values produce a warning in dmesg.
  */
@@ -2029,7 +2029,7 @@ static void dht_parse_config_line(const char *line)
     if (!key || !*key)
         return;
 
-    /* DEBUG — enable debug logging */
+    /* DEBUG -- enable debug logging */
     if (strcmp(key, "DEBUG") == 0) {
         int dbg = 1;
         if (val && *val) {
@@ -2043,7 +2043,7 @@ static void dht_parse_config_line(const char *line)
         return;
     }
 
-    /* AUTO_INTERVAL — global auto-poll interval */
+    /* AUTO_INTERVAL -- global auto-poll interval */
     if (strcmp(key, "AUTO_INTERVAL") == 0) {
         int ival;
         if (!val || !*val) {
@@ -2058,7 +2058,7 @@ static void dht_parse_config_line(const char *line)
         return;
     }
 
-    /* SENSOR — register a sensor */
+    /* SENSOR -- register a sensor */
     if (strcmp(key, "SENSOR") == 0) {
         int pin = -1, interval = -1;
         char *comma;
@@ -2105,7 +2105,7 @@ static void dht_parse_config_line(const char *line)
  * Opens /etc/default/dht (if it exists) and parses each line for
  * configuration options (DEBUG, AUTO_INTERVAL, SENSOR).
  *
- * The file is optional — if it does not exist or cannot be read,
+ * The file is optional -- if it does not exist or cannot be read,
  * the driver loads with defaults. Lines starting with '#' and empty
  * lines are ignored.
  *
@@ -2167,7 +2167,7 @@ static void dht_load_config(void)
     kfree(buf);
 }
 
-/* ── Module init / exit ────────────────────────────────────── */
+/* -- Module init / exit -------------------------------------- */
 
 /* Table of global proc entries created under /proc/sensors/dht/ */
 static const struct proc_entry_def global_proc_entries[] = {
@@ -2211,7 +2211,7 @@ static int __init dht_driver_init(void)
      *
      * Two cases:
      *   1. /proc/sensors does not exist yet:
-     *      proc_mkdir("sensors", NULL) succeeds → we own it.
+     *      proc_mkdir("sensors", NULL) succeeds -> we own it.
      *      proc_parent is set, we_created_parent = true.
      *      Create "dht" as a child: proc_mkdir("dht", proc_parent).
      *
@@ -2219,16 +2219,16 @@ static int __init dht_driver_init(void)
      *      proc_mkdir("sensors", NULL) returns NULL.
      *      We create "dht" via full path: proc_mkdir("sensors/dht", NULL).
      *      The kernel's xlate_proc_name() resolves the existing parent.
-     *      proc_parent stays NULL — we do NOT own /proc/sensors.
-     *      we_created_parent = false — we will NOT remove it on exit.
+     *      proc_parent stays NULL -- we do NOT own /proc/sensors.
+     *      we_created_parent = false -- we will NOT remove it on exit.
      */
     proc_parent = proc_mkdir(PROC_PARENT, NULL);
     if (proc_parent) {
-        /* We created /proc/sensors — we own it */
+        /* We created /proc/sensors -- we own it */
         we_created_parent = true;
         proc_dir = proc_mkdir(PROC_DIR_NAME, proc_parent);
     } else {
-        /* /proc/sensors already exists — use full path to create our subdir */
+        /* /proc/sensors already exists -- use full path to create our subdir */
         we_created_parent = false;
         proc_dir = proc_mkdir(PROC_PARENT "/" PROC_DIR_NAME, NULL);
     }
@@ -2271,13 +2271,13 @@ static int __init dht_driver_init(void)
  * Called when the module is unloaded (rmmod). Performs a safe two-phase
  * teardown to prevent race conditions with concurrent procfs operations:
  *
- * Phase 1 — Block new access and remove procfs:
+ * Phase 1 -- Block new access and remove procfs:
  *   1. Set dht_exiting flag (new dht_proc_open calls return -ENODEV)
  *   2. Disable global auto-poll (prevents new thread launches)
  *   3. Remove ALL procfs entries (proc_remove blocks until open files close)
  *
- * Phase 2 — Stop threads and free memory:
- *   4. Splice sensor list under lock (no new sensors can appear — procfs gone)
+ * Phase 2 -- Stop threads and free memory:
+ *   4. Splice sensor list under lock (no new sensors can appear -- procfs gone)
  *   5. For each sensor: stop poll thread, destroy mutex, free memory
  *
  * The key insight: after Phase 1, no new file operations can start because
@@ -2290,7 +2290,7 @@ static void __exit dht_driver_exit(void)
     LIST_HEAD(tmp_list);
     struct dht_sensor *sensor, *tmp;
 
-    /* ── Phase 1: Block new access and remove procfs ── */
+    /* -- Phase 1: Block new access and remove procfs -- */
 
     /* Set the exiting flag so dht_proc_open rejects any new file opens */
     atomic_set(&dht_exiting, 1);
@@ -2319,7 +2319,7 @@ static void __exit dht_driver_exit(void)
         }
     }
 
-    /* ── Phase 2: Stop threads and free memory ── */
+    /* -- Phase 2: Stop threads and free memory -- */
 
     /* Splice the sensor list under the lock. After proc_remove, no new
      * file operations can reach the sensors, so this is safe. */

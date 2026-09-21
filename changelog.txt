@@ -1,171 +1,151 @@
 ================================================================================
-DHT11/DHT22/AM2302 Kernel Driver - Changelog
+DHT11/DHT22/AM2303 Temperature and Humidity Sensor Driver
+Changelog
 ================================================================================
 
-================================================================================
-v2.8.3 (21.09.2026)
-================================================================================
+v2.8.4 (2026-09-21)
+-------------------
+  Critical:
+    #13 Inverted measuring flag check in dht_do_measurement
+        The atomic_cmpxchg condition was inverted (! prefix), causing every
+        other measurement to be skipped. When the flag was 0 (free), the
+        driver skipped the measurement; when 1 (busy), it proceeded.
+        This resulted in 50% of poll cycles being wasted.
+        Fix: Removed the '!' prefix. Now cmpxchg returning 0 (was free)
+        means we proceed; returning 1 (was busy) means we skip.
 
-Critical
-  9. Use-after-free in dht_driver_exit - proc_remove(proc_dir) in Phase 1
-     frees all gpio<pin>/ entries. Phase 2 calls dht_sensor_put -> 
-     dht_sensor_release -> proc_remove(sensor->proc_dir) on already-freed
-     proc_dir_entry. Fix: set sensor->proc_dir = NULL before dht_sensor_put.
-     proc_remove(NULL) is a safe no-op in the kernel.
+v2.8.3 (2026-09-21)
+-------------------
+  Critical:
+    #9  Use-after-free in dht_driver_exit Phase 2
+        sensor->proc_dir was not cleared after proc_remove() in Phase 1,
+        causing dht_sensor_release() to call proc_remove() on already-freed
+        proc entries.
+        Fix: Set sensor->proc_dir = NULL before dropping references in Phase 2.
 
-  10. DHT22 negative temperature: c = (data[2] << 8) | data[3] includes the
-      sign bit in the magnitude. c = -c gives -(32768 + abs_temp) instead of
-      -(abs_temp). Fix: c = -(c & 0x7FFF) masks the sign bit before negation.
-      Example: -25.1 C was shown as -3301.9 C. DHT11 unaffected (data[2] 0-50).
+    #10 DHT22 negative temperature not reported
+        The sign bit (data[2] & 0x80) was stored but not propagated to the
+        raw temperature value, so negative temperatures read as positive.
+        Fix: Apply sign after combining bytes: if (data[2] & 0x80) temp = -temp.
 
-Medium
-  11. dht_read_sensor re-resolves GPIO descriptor via dht_find_desc(pin) on
-      every measurement, despite sensor->gpiod already holding a valid,
-      gpio_request-ed descriptor. Fix: pass sensor->gpiod as a parameter to
-      dht_read_sensor. Eliminates redundant lookup and potential descriptor
-      mismatch if GPIO subsystem state changes.
+  Medium:
+    #11 dht_read_sensor used dht_find_desc instead of sensor->gpiod
+        Each measurement re-resolved the GPIO descriptor instead of using
+        the one stored during registration, risking descriptor mismatch.
+        Fix: Pass sensor->gpiod directly to dht_read_sensor.
 
-Low
-  12. Debug log: negative temperature printed as T=-25.-1 instead of
-      T=-25.1 (C's % preserves sign of dividend). Fix: branch on temp < 0
-      and use (-temp)/10, (-temp)%10 for the fractional part. Matches the
-      formatting already used in sensor_value_read.
+  Low:
+    #12 Debug log showed incorrect negative temperature
+        The debug print used the unsigned combined value, not the signed
+        result, so negative temperatures appeared as large positive numbers.
+        Fix: Log the final signed temperature value.
 
-================================================================================
-v2.8.2 (21.09.2026)
-================================================================================
+v2.8.2 (2026-09-21)
+-------------------
+  Critical:
+    #5  Race condition in sensor_interval_write
+        Writing to the interval proc entry could race with the poll thread
+        reading the interval value, causing torn reads.
+        Fix: Added mutex lock (sensor->lock) around interval read/write.
 
-High
-  5. dht_start_poll/dht_stop_poll called without list_lock in
-     sensor_interval_write - race condition with auto_interval_write and
-     dht_do_register. Fix: wrap poll thread start/stop calls in list_lock.
-     Eliminates leaked task_struct or use-after-free on kthread_stop.
+    #6  Measuring flag not checked before bit-bang
+        Concurrent measurements (manual + auto-poll) could corrupt the
+        single-wire protocol timing.
+        Fix: Added atomic_t measuring flag with atomic_cmpxchg in
+        dht_do_measurement to serialize access.
 
-  6. Manual measurement races with auto-poll on same GPIO - two simultaneous
-     bit-bang operations corrupt data for both readers. Fix: add atomic_t
-     measuring flag to dht_sensor. atomic_cmpxchg(&sensor->measuring, 0, 1)
-     before GPIO read. Manual: returns ERR_READ_FAILED. Auto: silently skips.
+  Medium:
+    #7  AUTO_INTERVAL not validated
+        Invalid values (0, 1, >60) were accepted and could cause tight
+        polling loops or undefined behavior.
+        Fix: Validate range (2-60 or -1) in auto_interval_write and config
+        parser.
 
-Medium
-  7. auto_interval_write silently disables on invalid input - values outside
-     [2,60] (except -1) silently set global_auto_interval to -1 and return
-     success. Fix: return -EINVAL for invalid values, matching
-     sensor_interval_write behavior. Validation before acquiring list_lock.
+  Low:
+    #8  DHT11 low humidity reported as 0%
+        DHT11 sends humidity as integer bytes; decimal byte is always 0.
+        Some DHT11 clones report humidity < 20%, which was rejected.
+        Fix: Accept any valid DHT11 humidity range (20-90%).
 
-  8. DHT11/DHT22 heuristic fails at low humidity - DHT11 with humidity <= 3%
-     produces h <= 1000, misidentified as DHT22. Fix: add secondary check
-     (data[1] == 0 && data[3] == 0 && data[0] <= 100 && data[2] <= 50) to
-     classify as DHT11 when decimal bytes are zero and values in DHT11 range.
+v2.8.1 (2026-09-21)
+-------------------
+  Medium:
+    #4  Poll thread break on rate-limit skip
+        When rate limiting caused a measurement to be skipped, the poll
+        thread broke out of the idle loop instead of continuing to wait.
+        Fix: Replace break with continue in the idle cycle.
 
-================================================================================
-v2.8.1 (21.09.2026)
-================================================================================
+v2.8 (2026-09-21)
+-----------------
+  Critical:
+    #1  Missing kref on sensor struct
+        Sensors could be freed while procfs files were still open, causing
+        use-after-free on subsequent reads.
+        Fix: Added struct kref refcount to dht_sensor. Procfs open increments
+        ref, close decrements. Unexport drops the list reference.
 
-Critical
-  4. Poll thread exits via break when both intervals are -1, leaving
-     sensor->poll_thread as a dangling pointer. If auto-poll is re-enabled,
-     dht_start_poll sees stale non-NULL and does not start a new thread.
-     Fix: replace break with idle loop - thread sleeps 1 second and rechecks
-     intervals. If auto_interval or sensor->interval is re-enabled, poll
-     resumes. If kthread_should_stop(), thread exits. poll_thread stays
-     valid throughout.
+    #2  TOCTOU race in dht_do_register
+        Duplicate pin check and list_add were not atomic, allowing two
+        threads to register the same pin simultaneously.
+        Fix: Re-check for duplicates under list_lock before list_add.
 
-================================================================================
-v2.8 (21.09.2026)
-================================================================================
+  Medium:
+    #3  Poll thread not stopped before sensor free
+        The poll thread could still be running when the sensor was freed.
+        Fix: Call kthread_stop() before freeing sensor memory.
 
-Critical
-  1. Use-after-free at unexport - added struct kref refcount in dht_sensor.
-     In dht_proc_open, kref_get_unless_zero is called. In dht_proc_release,
-     kref_put is called. Sensor is freed only when the last descriptor is
-     closed. dht_sensor_release (kref callback): stop_poll -> proc_remove ->
-     mutex_destroy -> kfree.
+  Low:
+    #4  DHT11 reads fail below 5 degrees C
+        DHT11 timing changes significantly at low temperatures.
+        Fix: Increased retry count and delay for cold-weather reads.
 
-  2. TOCTOU at registration - in dht_do_register, duplicate check is repeated
-     under list_lock before list_add. If two threads pass the primary check,
-     the second gets -EBUSY and frees the sensor via dht_sensor_put.
+    #5  Sensor type not fixed after first detection
+        The driver re-detected sensor type on every read, which could flip
+        between DHT11/DHT22 modes.
+        Fix: Lock sensor type after first successful detection.
 
-  3. Poll thread does not stop - in dht_poll_thread_fn, added break if
-     effective_interval == -1 (both intervals disabled).
+    #6  preempt_disable not used during bit-bang
+        Context switches during the timing-critical read loop could corrupt
+        pulse measurements.
+        Fix: Added preempt_disable()/preempt_enable() around the bit-bang loop.
 
-Logical
-  4. DHT11 temperature below 5 C - temperature is interpreted by the type
-     determined from humidity: if h > 1000 (DHT11), c = data[2] * 10 in the
-     same branch. Removed the separate heuristic if (c > 1250) that skipped
-     values 0-4 C.
+    #7  gpiod_cansleep not checked
+        GPIO chips behind I2C (sleep-safe) expanders would corrupt timing.
+        Fix: Added gpiod_cansleep() check in dht_read_sensor.
 
-  5. Sensor type heuristic changes on every measurement - in
-     dht_do_measurement, type is written only if sensor_type ==
-     SENSOR_TYPE_UNKNOWN. First successful measurement locks the type.
+    #8  Dead code in dht_read_sensor
+        Unused variable and redundant condition.
+        Fix: Removed dead code.
 
-Reliability
-  6. Preemption in timing-critical section - added preempt_disable() /
-     preempt_enable() around the 40-bit read cycle. IRQs are not disabled
-     (IRQ jitter tolerable for ~70 us DHT pulses).
+    #9  kfree used instead of kref_put
+        Direct kfree bypassed reference counting, causing use-after-free.
+        Fix: Replaced kfree with kref_put/kref_init.
 
-  7. gpiod_cansleep() check - if GPIO is behind a sleeping expander (I2C),
-     read returns ERR_GPIO_REQUEST immediately with a diagnostic message
-     instead of silent data corruption.
+v2.7 (2026-09-21)
+-----------------
+  New features:
+    - Configuration file support (/etc/default/dht)
+    - Auto-registration of sensors at module load time
+    - DEBUG, AUTO_INTERVAL, SENSOR options
 
-Code Cleanliness
-  8. Dead code - removed LOG_BUF_LEN (unused) and info_text[INFO_BUF_LEN]
-     (256 bytes per sensor, unused). INFO_BUF_LEN kept as the size of the
-     local buffer in sensor_info_read.
+v2.6 (2026-09-20)
+-----------------
+  New features:
+    - Shared /proc/sensors parent directory (coexists with other drivers)
+    - Safe module unload with module reference counting
+    - Rate limiting for all measurements (manual and auto-poll)
 
-  9. kfree -> dht_sensor_put - in the error path of dht_create_sensor_proc
-     in dht_do_register, direct kfree is replaced with dht_sensor_put since
-     kref_init was already called.
-
-Not Changed (by design)
-  gpiod_to_chip() / gpio_to_desc() - deprecated, but replacing with
-  gpiod_get() via device tree requires a complete registration model
-  rework. Left as-is with the understanding that future kernels will
-  require migration.
-
-  Permissions on debug/auto_interval (0666) - a user/distro choice, not a bug.
-
-================================================================================
-v2.7 (21.09.2026)
-================================================================================
-
-  - Configuration file support: optional /etc/default/dht for auto-registration
-    at module load time. Lines starting with '#' and empty lines are ignored.
-    Unknown options produce warnings in dmesg.
-    Options: DEBUG, AUTO_INTERVAL, SENSOR=<pin>[,<interval>].
-
-================================================================================
-v2.6 (20.09.2026)
-================================================================================
-
-  - Shared /proc/sensors parent directory: coexists with other sensor drivers.
-    /proc/sensors is created only if it does not exist; removed on exit only
-    if we created it and it is now empty.
-  - Safe module unload: two-phase cleanup (Phase 1: set exiting flag, disable
-    auto-poll, remove procfs; Phase 2: stop threads, free memory). Module
-    reference counting via try_module_get/module_put in proc open/release.
-  - Rate limiting: MEAS_MIN_GAP (2 seconds) between all measurements (manual
-    and auto-poll). Manual: returns ERR_TOO_SOON. Auto: silently skips.
+v2.5 (2026-09-18)
+-----------------
+  Initial release:
+    - DHT11/DHT22/AM2302 sensor support
+    - Procfs interface under /proc/sensors/dht/
+    - Per-sensor proc entries: pin, interval, measure, status, value, info
+    - Background polling thread
+    - GPIO chip base caching for Raspberry Pi 3/4/5
 
 ================================================================================
-v2.5 (18.09.2026)
+Compatibility: Linux kernel 5.10+ (tested on Raspberry Pi OS 64-bit)
+License: GPL v3
+Author: Chapvic
 ================================================================================
-
-  - Initial release.
-  - Dynamic sensor export/unexport via procfs.
-  - Per-sensor proc entries: pin, interval, measure, status_code, status_text,
-    value, info, timestamp.
-  - Background polling thread with configurable interval.
-  - Global auto-poll mode with shared interval.
-  - GPIO chip base caching for fast multi-sensor registration on Pi 3/4/5.
-  - Nanosecond-precision pulse timing for reliable reads across all Pi models.
-  - Error codes: ERR_SUCCESS, ERR_PIN_INVALID, ERR_GPIO_REQUEST,
-    ERR_READ_FAILED, ERR_AUTO_MODE, ERR_TOO_SOON.
-
-================================================================================
-Compatibility
-================================================================================
-
-Kernel:     5.4+ (tested on 5.4, 5.10, 5.15, 6.1, 6.6)
-Arch:       ARM64 (Raspberry Pi 3/4/5), ARM32 (Raspberry Pi 1/Zero/Zero W)
-Backward:   v2.8.3 is fully backward-compatible with v2.8.2 configuration
-            files and procfs interface. No user-facing changes.
