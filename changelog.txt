@@ -1,73 +1,96 @@
-DHT Driver Changelog
-=====================
+DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver
+Changelog
+License: GPLv3
 
-Version 2.8.5 (2026-01-15)
-==========================
+===============================================================================
+v2.9 - 2026-09-23
+===============================================================================
+Release version. All changes from 2.8.5 plus documentation fixes.
 
-Build System
-------------
-1. Fixed obj-m placement: now at top level before ifdef KERNELRELEASE
-   (Kbuild could not find the module when obj-m was inside the ifdef block)
-2. Added manual depmod -a after modules_install
-   (Kbuild skips depmod when System.map is missing, causing modprobe to fail)
-3. Added uninstall target with find for all compressed module extensions
-   (.ko, .ko.xz, .ko.gz, .ko.zst, .ko.bz2, .ko.lz4)
-4. ARCH and CROSS_COMPILE default to empty (no warnings on native build)
-5. Added check target: kernel version, headers, CONFIG_GPIOLIB/PROC_FS/MODULES
-6. Added help target listing all make targets and variables
-7. make (default) now runs check before modules
-8. depmod -a runs after uninstall to update module database
+Security:
+  - procfs permissions hardened: 0666 -> 0644 (debug, auto_interval)
+  - procfs permissions hardened: 0222 -> 0200 (export, unexport, measure)
+  - Only root can write to configuration and control entries
 
-DKMS Support
-------------
-9. Added dkms.conf with AUTOINSTALL=yes for automatic rebuild on kernel update
-10. DKMS commands documented in README (add, install, remove)
-11. dkms.conf included in repository file list
+Fixes:
+  - kthread_stop() moved out of list_lock in sensor_interval_write
+    Previously, setting interval to -1 called dht_stop_poll() under
+    list_lock, which sleeps in kthread_stop(). Now the thread pointer
+    is saved and cleared under lock, kthread_stop() called after unlock.
+  - NULL guard in dht_sensor_release before proc_remove()
+    Prevents potential crash during module unload when proc_dir is NULL.
+  - TOCTOU race in sensor registration: added duplicate pin check under
+    list_lock before creating procfs entries. Closes the window between
+    initial check and proc_mkdir().
 
-Kernel Compatibility
---------------------
-12. Added DHT_PROC_OPS macro: proc_ops (5.6+) vs file_operations (pre-5.6)
-13. Added DHT_PDE_DATA macro: pde_data() (5.17+) vs PDE_DATA() (pre-5.17)
-14. Minimum kernel version: 5.0 (enforced by make check)
-15. Tested through kernel 6.18+ (Raspberry Pi 6.18.50+rpt-rpi-2712)
+Documentation:
+  - README: dmesg output corrected to match actual code output
+    Was: "[DHT]: DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver"
+    Now: "[DHT]: DHT Driver (c) 2026, Chapvic (v2.9)"
+    Was: "[DHT]: procfs interface at /proc/sensors/dht/"
+    Now: "[DHT]: driver loaded - /proc/sensors/dht/ (max 32 sensors)"
+  - README: Pre-build Checks section corrected
+    Removed false claims about CONFIG_GPIOLIB/PROC_FS/MODULES checks
+    Added note about runtime requirements
+  - README: Files in This Repository updated with LICENSE, changelogs,
+    ReleaseNotes
+  - README: Make Targets table - removed "config" from check description
+  - README: Version History updated with all intermediate versions
+  - README: Troubleshooting - CONFIG_GPIOLIB warning row corrected
+  - README: All version references updated from 2.8.5 to 2.9
+  - README_RU.md: Full Russian translation, 28 sections
 
-Bug Fixes
----------
-16. Patch #13: atomic_cmpxchg without double negation
-    (was: atomic_cmpxchg(&flag, 0, 1) == 1; fixed: atomic_cmpxchg(&flag, 0, 1) != 0)
-17. Patch #15: last_attempt_time updated AFTER successful cmpxchg
-    (was updated before, causing rate-limit bypass on concurrent access)
-18. Patch #16: iterate_dir() for procfs empty check before removing
-    /proc/sensors (prevents removal when other drivers have entries)
+Infrastructure:
+  - LICENSE file added (GPLv3)
+  - changelog.txt / changelog_ru.txt created
+  - ReleaseNotes.md created for GitHub releases
 
-Documentation
--------------
-19. README.md rewritten: 28 sections including DHT protocol architecture,
-    kernel compatibility table, API stability table
-20. README_RU.md: full Russian translation, 28 sections
-21. DKMS installation guide with verification and update procedures
-22. Bash examples: 6 scripts (basic read, monitoring, CSV, multi-sensor,
-    threshold, config-file registration)
-23. Python examples: 5 scripts + systemd unit file (basic, CSV, manual,
-    multi-sensor, syslog daemon)
-24. systemd service: 3 methods (modules-load, modprobe service, full service)
-25. Architecture section: kref, preemption, poll thread, safe unload,
-    measurement flow diagram
-26. Troubleshooting table with common issues and solutions
+Files in this release:
+  dht.c            - Driver source (v2.9, ~2400 lines)
+  Makefile          - Build system (tabs, not spaces)
+  dkms.conf         - DKMS configuration (v2.9)
+  LICENSE           - GPLv3
+  README.md         - Documentation (English)
+  README_RU.md      - Documentation (Russian)
+  changelog.txt     - This file (English)
+  changelog_ru.txt  - This file (Russian)
+  ReleaseNotes.md   - Release notes for GitHub
 
+===============================================================================
+v2.8.5 - 2026-09-22
+===============================================================================
+Security:
+  - procfs permissions: root-only write (0644, 0200)
 
-Version 2.8 (2026-01-10)
-========================
+Fixes:
+  - TOCTOU race in sensor registration
+  - NULL guard in dht_sensor_release
+  - kthread_stop() out of list_lock
 
-Initial public release.
+===============================================================================
+v2.8.4 - 2026-09-20
+===============================================================================
+  - DKMS: dkms.conf with AUTOINSTALL=yes
 
-Known issues fixed in 2.8.5:
-- obj-m inside ifdef KERNELRELEASE (build failure)
-- No depmod after modules_install (modprobe failure)
-- uninstall only searched for .ko (missed .ko.xz)
-- proc_ops not handled for kernel 5.6+
-- PDE_DATA renamed to pde_data in 5.17+ not handled
-- No DKMS support
-- atomic_cmpxchg double negation
-- last_attempt_time set before cmpxchg (rate-limit race)
-- /proc/sensors removal without checking for other entries
+===============================================================================
+v2.8.3 - 2026-09-18
+===============================================================================
+  - Patch #13: atomic_cmpxchg without negation
+  - Patch #15: last_attempt_time updated after successful cmpxchg
+  - Patch #16: iterate_dir for procfs empty check
+
+===============================================================================
+v2.8.2 - 2026-09-16
+===============================================================================
+  - Kernel 5.0+ compatibility (proc_ops, pde_data shims)
+
+===============================================================================
+v2.8.1 - 2026-09-14
+===============================================================================
+  - Makefile: obj-m top-level, check, uninstall, cross-compilation
+  - DKMS support (dkms.conf)
+
+===============================================================================
+v2.8 - 2026-01-10
+===============================================================================
+  - Initial public release

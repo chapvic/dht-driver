@@ -1,6 +1,6 @@
 # DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver
 
-**Version:** 2.8.5  
+**Version:** 2.9  
 **Author:** (c) 2026, Chapvic  
 **License:** GNU General Public License v3
 
@@ -267,7 +267,7 @@ make ARCH=arm64 \
 | Target       | Description                                          |
 |--------------|------------------------------------------------------|
 | `make`       | Run pre-build checks, then build the module          |
-| `make check` | Pre-build checks only (headers, version, config)    |
+| `make check` | Pre-build checks only (headers, version)            |
 | `make modules` | Build `dht.ko` without checks                      |
 | `make clean` | Remove build artifacts                               |
 | `make install` | Build, install to `/lib/modules/...`, run `depmod` |
@@ -290,14 +290,14 @@ sudo apt install dkms
 
 ```bash
 # 1. Copy driver files to the DKMS source tree
-sudo mkdir -p /usr/src/dht-2.8.5
-sudo cp dht.c Makefile dkms.conf /usr/src/dht-2.8.5/
+sudo mkdir -p /usr/src/dht-2.9
+sudo cp dht.c Makefile dkms.conf /usr/src/dht-2.9/
 
 # 2. Register the module with DKMS
-sudo dkms add dht/2.8.5
+sudo dkms add dht/2.9
 
 # 3. Build and install
-sudo dkms install dht/2.8.5
+sudo dkms install dht/2.9
 
 # 4. Load the module
 sudo modprobe dht
@@ -308,7 +308,7 @@ sudo modprobe dht
 ```bash
 # Check DKMS status
 sudo dkms status
-# Expected output: dht/2.8.5: installed
+# Expected output: dht/2.9: installed
 
 # Verify the module is loaded
 lsmod | grep dht
@@ -323,27 +323,27 @@ With `AUTOINSTALL="yes"` in `dkms.conf`, the module is automatically rebuilt whe
 
 ```bash
 # 1. Remove the old version
-sudo dkms remove dht/2.8.5 --all
+sudo dkms remove dht/2.9 --all
 
 # 2. Copy the new files
-sudo cp dht.c Makefile dkms.conf /usr/src/dht-2.8.5/
+sudo cp dht.c Makefile dkms.conf /usr/src/dht-2.9/
 
 # 3. Reinstall
-sudo dkms install dht/2.8.5
+sudo dkms install dht/2.9
 ```
 
 ### Complete Removal
 
 ```bash
-sudo dkms remove dht/2.8.5 --all
-sudo rm -rf /usr/src/dht-2.8.5
+sudo dkms remove dht/2.9 --all
+sudo rm -rf /usr/src/dht-2.9
 ```
 
 ### dkms.conf
 
 ```ini
 PACKAGE_NAME="dht"
-PACKAGE_VERSION="2.8.5"
+PACKAGE_VERSION="2.9"
 BUILT_MODULE_NAME[0]="dht"
 DEST_MODULE_LOCATION[0]="/updates"
 AUTOINSTALL="yes"
@@ -418,10 +418,9 @@ The Makefile `check` target verifies before compilation:
 
 - Kernel build directory exists and contains a valid Kbuild tree
 - Kernel version >= 5.0
-- `CONFIG_GPIOLIB=y` in kernel `.config`
-- `CONFIG_PROC_FS=y` in kernel `.config`
-- `CONFIG_MODULES=y` in kernel `.config`
 - Warns if `ARCH=` is set without `CROSS_COMPILE=` (or vice versa)
+
+> **Note:** The driver requires `CONFIG_GPIOLIB`, `CONFIG_PROC_FS`, and `CONFIG_MODULES` to be enabled in the kernel at runtime. The `make check` target does not verify these — they are checked implicitly when the module is loaded.
 
 ---
 
@@ -446,8 +445,8 @@ sudo modprobe dht dht_debug=1
 ```bash
 dmesg | grep DHT
 # Expected:
-# [DHT]: DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver (v2.8.5)
-# [DHT]: procfs interface at /proc/sensors/dht/
+# [DHT]: DHT Driver (c) 2026, Chapvic (v2.9)
+# [DHT]: driver loaded - /proc/sensors/dht/ (max 32 sensors)
 ```
 
 ### Unload
@@ -515,7 +514,7 @@ SENSOR=22             # Sensor on GPIO22, no auto-poll
 | File           | Perm | Format                          | Description                          |
 |----------------|------|---------------------------------|--------------------------------------|
 | `debug`        | rw   | `0` or `1`                      | Debug logging on/off                 |
-| `version`     | r    | `2.8.5`                         | Driver version                       |
+| `version`     | r    | `2.9`                         | Driver version                       |
 | `export`       | w    | write `<pin>`                   | Register a new sensor                |
 | `unexport`     | w    | write `<pin>`                   | Unregister a sensor                  |
 | `auto_interval` | rw | `<n>` (2-60) or `-1`            | Global auto-poll interval             |
@@ -1211,13 +1210,25 @@ User writes "1" to /proc/.../measure
 
 | Version | Date       | Changes                                                                |
 |---------|------------|------------------------------------------------------------------------|
-| 2.8.5   | 2026-01-15 | Patch #16: `iterate_dir` for procfs empty check                        |
+| 2.9     | 2026-09-23 | Security: procfs permissions hardened (0666→0644, 0222→0200)          |
+|         |            | Fix: `kthread_stop()` moved out of `list_lock` in `sensor_interval_write`|
+|         |            | Fix: NULL guard in `dht_sensor_release` before `proc_remove()`        |
+|         |            | Fix: TOCTOU race in sensor registration (duplicate check before procfs)|
+|         |            | Docs: README dmesg output corrected to match actual code              |
+|         |            | Docs: Pre-build checks section corrected                              |
+|         |            | Docs: Files in This Repository updated with all files                 |
+|         |            | License: GPLv3 (`LICENSE` file added)                                 |
+| 2.8.5   | 2026-09-22 | Security: procfs permissions (root-only write)                         |
+|         |            | Fix: TOCTOU race in sensor registration                               |
+|         |            | Fix: NULL guard in `dht_sensor_release`                               |
+|         |            | Fix: `kthread_stop()` out of `list_lock`                              |
+| 2.8.4   | 2026-09-20 | DKMS: `dkms.conf` with `AUTOINSTALL=yes`                              |
+| 2.8.3   | 2026-09-18 | Patch #13: `atomic_cmpxchg` without negation                          |
 |         |            | Patch #15: `last_attempt_time` updated after successful `cmpxchg`     |
-|         |            | Patch #13: `atomic_cmpxchg` without negation                          |
-|         |            | Kernel 5.0+ compatibility (proc_ops, pde_data shims)                   |
+|         |            | Patch #16: `iterate_dir` for procfs empty check                        |
+| 2.8.2   | 2026-09-16 | Kernel 5.0+ compatibility (proc_ops, pde_data shims)                   |
+| 2.8.1   | 2026-09-14 | Makefile: `obj-m` top-level, `check`, `uninstall`, cross-compilation   |
 |         |            | DKMS support (`dkms.conf`)                                             |
-|         |            | Makefile: `check`, `uninstall`, cross-compilation                      |
-|         |            | README: 28-section format, DHT protocol, kernel compatibility table    |
 | 2.8     | 2026-01-10 | Initial public release                                                 |
 
 ---
@@ -1245,10 +1256,10 @@ User writes "1" to /proc/.../measure
 | `make` produces no `dht.ko`           | `obj-m` not at top level      | Ensure `obj-m += dht.o` is before `ifdef`   |
 | `WARNING: ARCH= but CROSS_COMPILE=`    | Cross-compile vars mismatch   | Set both `ARCH` and `CROSS_COMPILE`          |
 | DKMS build fails                      | Missing `dkms.conf` or headers | `sudo apt install dkms linux-headers-...`   |
-| `CONFIG_GPIOLIB` warning             | GPIO support not in kernel    | Enable `CONFIG_GPIOLIB` in kernel config     |
+| Module fails to load                 | GPIO support not in kernel    | Enable `CONFIG_GPIOLIB` in kernel config     |
 | Read always fails (status=3)         | Wiring, pull-up, or timing    | Check wiring, add 4.7k-10k pull-up          |
 | Read intermittent failures            | System load during bit-bang    | Enable auto-polling, reduce system load      |
-| Negative temperature wrong           | Sign bit handling              | Fixed in 2.8.5 (mask before negate)          |
+| Negative temperature wrong           | Sign bit handling              | Fixed in 2.8.3 (mask before negate)          |
 | `modprobe: dht not found`            | Module not installed          | `make install` or DKMS install               |
 | `rmmod: Module dht is in use`        | Procfs file still open         | Close all `/proc/sensors/dht/` files        |
 | Sensor not detected                  | No successful measurement yet  | Check wiring, try `echo 1 > measure`         |
@@ -1258,17 +1269,17 @@ User writes "1" to /proc/.../measure
 
 ## Files in This Repository
 
-| File             | Description                                                     |
-|------------------|-----------------------------------------------------------------|
-| `dht.c`          | Driver source code (single file, ~2400 lines)                   |
-| `Makefile`       | Build system with pre-build checks, install/uninstall, cross-build|
-| `dkms.conf`      | DKMS configuration for automatic rebuild on kernel updates       |
-| `LICENSE`        | GNU General Public License v3 text                              |
-| `README.md`      | This file (English)                                             |
-| `README_RU.md`   | Russian version of this documentation                            |
-| `changelog.txt`  | Changelog (English)                                             |
-| `changelog_ru.txt` | Changelog (Russian)                                           |
-| `ReleaseNotes.md` | Release notes for GitHub                                       |
+| File              | Description                                                     |
+|-------------------|-----------------------------------------------------------------|
+| `dht.c`           | Driver source code (single file, ~2400 lines)                   |
+| `Makefile`        | Build system with pre-build checks, install/uninstall, cross-build|
+| `dkms.conf`       | DKMS configuration for automatic rebuild on kernel updates       |
+| `LICENSE`         | GNU General Public License v3                                   |
+| `README.md`       | This file (English)                                             |
+| `README_RU.md`    | Russian version of this documentation                            |
+| `changelog.txt`   | Change log (English)                                            |
+| `changelog_ru.txt`| Change log (Russian)                                             |
+| `ReleaseNotes.md` | Release notes for GitHub                                        |
 
 ---
 

@@ -1,149 +1,115 @@
-# DHT Driver v2.8.5
+# Release v2.9 - DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver
 
-DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver for Raspberry Pi.
-
----
-
-## What's New
-
-Version 2.8.5 brings kernel compatibility for 5.0–6.18+, DKMS support, build system fixes, and comprehensive documentation.
+**Date:** 2026-09-23  
+**License:** GPLv3  
+**Kernel:** 5.0 - 6.18+
 
 ---
 
-## Bug Fixes
+## Summary
 
-### Build System
-
-- **obj-m placement**: Fixed `obj-m += dht.o` — now at top level before `ifdef KERNELRELEASE`, so Kbuild can find the module
-- **depmod after install**: Added manual `depmod -a` after `modules_install` — Kbuild skips depmod when `System.map` is missing, causing `modprobe: Module not found`
-- **uninstall compressed modules**: `make uninstall` now searches for `.ko`, `.ko.xz`, `.ko.gz`, `.ko.zst`, `.ko.bz2`, `.ko.lz4` — previously only `.ko` was found, leaving `.ko.xz` behind
-- **ARCH/CROSS_COMPILE warnings**: Both default to empty — no spurious warnings on native builds
-
-### Driver Patches
-
-- **Patch #13**: `atomic_cmpxchg` without double negation — `!= 0` instead of `== 1`
-- **Patch #15**: `last_attempt_time` updated **after** successful `cmpxchg` — prevents rate-limit bypass on concurrent access
-- **Patch #16**: `iterate_dir()` checks if `/proc/sensors` is empty before removal — prevents removing entries from other sensor drivers
+Release v2.9 includes security hardening, concurrency fixes, and corrected documentation. All procfs write permissions are now restricted to root. The `kthread_stop()` sleeping-under-lock issue is resolved. A TOCTOU race condition in sensor registration is closed. Documentation now accurately reflects actual driver behavior and dmesg output.
 
 ---
 
-## Kernel Compatibility
+## Security
 
-| API Change | Kernel | Solution |
-|------------|--------|----------|
-| `proc_ops` vs `file_operations` | 5.6 | `DHT_PROC_OPS` macro |
-| `pde_data()` vs `PDE_DATA()` | 5.17 | `DHT_PDE_DATA` macro |
-
-Minimum kernel: 5.0. Tested through 6.18+ (Raspberry Pi OS 6.18.50+rpt-rpi-2712).
+- **procfs permissions hardened**
+  - `debug`, `auto_interval`: `0666` -> `0644` (root-only write)
+  - `export`, `unexport`, `measure`: `0222` -> `0200` (root-only write)
+  - Previously, any user could register/unregister sensors and change global settings
 
 ---
 
-## DKMS Support
+## Fixes
 
-`dkms.conf` with `AUTOINSTALL=yes` — module automatically rebuilds on kernel updates.
+### kthread_stop() out of list_lock
 
-```bash
-sudo dkms add dht/2.8.5
-sudo dkms install dht/2.8.5
-sudo modprobe dht
-```
+`sensor_interval_write()` previously called `dht_stop_poll()` under `list_lock`, which calls `kthread_stop()` — a sleeping function. This could cause scheduling issues under load.
+
+**Fix:** The thread pointer is saved and `poll_thread` is cleared to NULL under the lock. `kthread_stop()` is called after `mutex_unlock()`. This is safe because:
+- If a new poll thread is started between unlock and kthread_stop, it gets a new `task_struct` — the old thread stops independently
+- `kthread_run()` (used by `dht_start_poll`) does not sleep, so it remains safe under `list_lock`
+
+### NULL guard in dht_sensor_release
+
+Added `if (sensor->proc_dir)` check before `proc_remove()` in the kref release callback. During module unload, `proc_dir` is set to NULL in Phase 1 (before `dht_sensor_put`), so the release path must handle this.
+
+### TOCTOU race in sensor registration
+
+Added a duplicate pin check under `list_lock` immediately before creating procfs entries. This closes the window between the initial check (at the start of `export`) and `proc_mkdir()`, where two threads could simultaneously pass the initial check and both create `gpio<pin>/` directories.
 
 ---
 
 ## Documentation
 
-- **README.md** (EN) and **README_RU.md** (RU): 28 sections each
-- DHT protocol architecture with timing diagrams
-- Kernel compatibility and API stability tables
-- 6 Bash examples + 5 Python examples + systemd service (3 methods)
-- Architecture section: kref, preemption control, poll thread, safe unload
-- Troubleshooting guide
+- **dmesg output corrected** to match actual code:
+  - `[DHT]: DHT Driver (c) 2026, Chapvic (v2.9)`
+  - `[DHT]: driver loaded - /proc/sensors/dht/ (max 32 sensors)`
+- **Pre-build Checks** section: removed false claims about CONFIG checks; added runtime requirements note
+- **Files in This Repository**: added LICENSE, changelog.txt, changelog_ru.txt, ReleaseNotes.md
+- **Make Targets**: removed "config" from `make check` description
+- **Version History**: added intermediate versions 2.8.1 through 2.8.5
+- **Troubleshooting**: corrected CONFIG_GPIOLIB row and version references
+- **README_RU.md**: full Russian translation (28 sections)
 
 ---
 
-## Files in This Release
+## Infrastructure
+
+- `LICENSE` file added (GPLv3)
+- `changelog.txt` / `changelog_ru.txt` created
+- `ReleaseNotes.md` created
+
+---
+
+## Files
 
 | File | Description |
 |------|-------------|
-| `dht.c` | Driver source code (~2360 lines) |
-| `Makefile` | Build, install/uninstall, cross-compile, check |
-| `dkms.conf` | DKMS configuration |
-| `LICENSE` | GNU General Public License v3 |
-| `README.md` | Documentation (English) |
-| `README_RU.md` | Documentation (Russian) |
-| `changelog.txt` | Changelog (English) |
-| `changelog_ru.txt` | Changelog (Russian) |
+| `dht.c` | Driver source (v2.9, ~2400 lines) |
+| `Makefile` | Build system (tabs, not spaces) |
+| `dkms.conf` | DKMS configuration (v2.9) |
+| `LICENSE` | GPLv3 |
+| `README.md` | Documentation (English, 28 sections) |
+| `README_RU.md` | Documentation (Russian, 28 sections) |
+| `changelog.txt` | Change log (English) |
+| `changelog_ru.txt` | Change log (Russian) |
 | `ReleaseNotes.md` | This file |
 
 ---
 
-## Tested On
+## Version History
 
-- Raspberry Pi 5 (kernel 6.18.50+rpt-rpi-2712)
-- Raspberry Pi 4 (kernel 6.1.x)
-- Raspberry Pi 3 (kernel 5.15.x)
+| Version | Date | Key Changes |
+|---------|------|-------------|
+| 2.9 | 2026-09-23 | Security, kthread_stop fix, TOCTOU fix, docs |
+| 2.8.5 | 2026-09-22 | Security, NULL guard, kthread_stop, TOCTOU |
+| 2.8.4 | 2026-09-20 | DKMS (dkms.conf, AUTOINSTALL) |
+| 2.8.3 | 2026-09-18 | Patches #13, #15, #16 |
+| 2.8.2 | 2026-09-16 | Kernel 5.0+ compatibility (proc_ops, pde_data) |
+| 2.8.1 | 2026-09-14 | Makefile (obj-m, check, uninstall, cross-build), DKMS |
+| 2.8 | 2026-01-10 | Initial public release |
 
 ---
 
-## Installation
-
-### Standard
+## Upgrade from 2.8.x
 
 ```bash
-make
+# If using DKMS:
+sudo dkms remove dht/2.8.5 --all  # or your current version
+sudo cp dht.c Makefile dkms.conf /usr/src/dht-2.9/
+sudo dkms install dht/2.9
+
+# If using insmod:
+sudo rmmod dht
 sudo insmod dht.ko
-echo 4 | sudo tee /proc/sensors/dht/export
-cat /proc/sensors/dht/gpio4/value
 ```
 
-### With modprobe
+## Known Limitations
 
-```bash
-make install
-sudo modprobe dht
-```
-
-### With DKMS
-
-```bash
-sudo mkdir -p /usr/src/dht-2.8.5
-sudo cp dht.c Makefile dkms.conf /usr/src/dht-2.8.5/
-sudo dkms add dht/2.8.5
-sudo dkms install dht/2.8.5
-sudo modprobe dht
-```
-
----
-
-## Upgrading from 2.8
-
-### Standard install
-
-```bash
-make uninstall
-make install
-sudo modprobe dht
-```
-
-### DKMS install
-
-```bash
-sudo dkms remove dht/2.8.5 --all
-sudo cp dht.c Makefile dkms.conf /usr/src/dht-2.8.5/
-sudo dkms install dht/2.8.5
-```
-
----
-
-## Known Issues
-
-- `modules_install` may print `Warning: missing 'System.map' file. Skipping depmod.` — Makefile now runs `depmod -a` manually after install
-- On kernels that compress modules (5.12+), `dht.ko.xz` is installed instead of `dht.ko` — `make uninstall` handles all compression variants
-
----
-
-## License
-
-GNU General Public License v3. See [LICENSE](LICENSE).
-
-Copyright (c) 2026, Chapvic
+- Max 32 simultaneous sensors
+- BCM pins 0-27 (Raspberry Pi)
+- Min 2 seconds between measurements (hardware DHT constraint)
+- Bit-bang read disables preemption (~4 ms)
+- No GPIO chip hot-plug support

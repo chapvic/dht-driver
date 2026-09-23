@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2026, Chapvic
  *
- * Version: 2.8.5
+ * Version: 2.9
  *
  * License: GPLv3
  *
@@ -101,7 +101,7 @@
 /* Driver metadata constants used in MODULE_* macros and dmesg output */
 #define DHT_DRIVER_AUTHOR        "DHT Driver (c) 2026, Chapvic"
 #define DHT_DRIVER_DESCRIPTION   "DHT11/DHT22/AM2302 Temperature and Humidity Sensor Driver"
-#define DHT_DRIVER_VERSION       "2.8.5"
+#define DHT_DRIVER_VERSION       "2.9"
 #define DHT_DRIVER_LICENSE       "GPL"
 
 MODULE_LICENSE(DHT_DRIVER_LICENSE);
@@ -804,6 +804,7 @@ static int dht_poll_thread_fn(void *data)
  */
 static void dht_start_poll(struct dht_sensor *sensor)
 {
+    /* Caller must hold list_lock to protect poll_thread field */
     /* Don't start a duplicate thread if one is already running */
     if (sensor->poll_thread)
         return;
@@ -829,6 +830,8 @@ static void dht_start_poll(struct dht_sensor *sensor)
  */
 static void dht_stop_poll(struct dht_sensor *sensor)
 {
+    /* Caller must hold list_lock, OR be in the final release path
+     * (dht_sensor_release) where no concurrent access is possible. */
     struct task_struct *thread;
 
     if (!sensor->poll_thread)
@@ -875,10 +878,12 @@ static void dht_sensor_release(struct kref *ref)
 {
     struct dht_sensor *sensor = container_of(ref, struct dht_sensor, refcount);
 
+    /* Safe: this is the last kref reference -- no concurrent access possible. */
     dht_stop_poll(sensor);              /* Stop the background polling thread */
     if (sensor->gpiod)
         gpio_free(desc_to_gpio(sensor->gpiod));  /* Release the GPIO line */
-    proc_remove(sensor->proc_dir);      /* Remove all procfs entries for this sensor */
+    if (sensor->proc_dir)
+        proc_remove(sensor->proc_dir);      /* Remove all procfs entries for this sensor */
     mutex_destroy(&sensor->lock);       /* Clean up the mutex */
     kfree(sensor);                      /* Free the sensor struct */
 }
@@ -1597,7 +1602,7 @@ struct proc_entry_def {
 static const struct proc_entry_def sensor_proc_entries[] = {
     { "pin",         0444, &sensor_pin_fops },
     { "interval",    0644, &sensor_interval_fops },
-    { "measure",     0222, &sensor_measure_fops },
+    { "measure",     0200, &sensor_measure_fops },
     { "status_code", 0444, &sensor_status_code_fops },
     { "status_text", 0444, &sensor_status_text_fops },
     { "value",       0444, &sensor_value_fops },
@@ -1740,6 +1745,25 @@ static int dht_do_register(int pin, int interval)
     mutex_init(&sensor->lock);
     kref_init(&sensor->refcount);   /* Start with refcount = 1 (owned by list) */
 
+    /* Re-check for duplicates under list_lock BEFORE creating procfs entries.
+     * This closes the TOCTOU window between the initial check (above) and
+     * procfs creation: if a concurrent registration already won, we bail
+     * out before creating procfs entries with the same name.
+     *
+     * Note: gpio_request above also prevents concurrent registration of
+     * the same pin (the loser gets -EBUSY), but this check provides
+     * defense in depth and fails fast without wasting time on procfs
+     * creation and a 20+ ms measurement cycle. */
+    mutex_lock(&list_lock);
+    list_for_each_entry(s, &sensor_list, list) {
+        if (s->pin == pin) {
+            mutex_unlock(&list_lock);
+            dht_err("pin %d raced with concurrent registration\n", pin);
+            dht_sensor_free(sensor);
+            return -EBUSY;
+        }
+    }
+    mutex_unlock(&list_lock);
     /* Create procfs entries for this sensor */
     if (dht_create_sensor_proc(sensor)) {
         /* kref was already initialized above; use put to release it
@@ -1762,9 +1786,10 @@ static int dht_do_register(int pin, int interval)
         return -EIO;
     }
 
-    /* Add the sensor to the global list -- re-check for duplicates under
-     * the lock to close the TOCTOU window between the initial check
-     * and the list_add. */
+    /* Add the sensor to the global list. Final re-check for duplicates
+     * under the lock as defense in depth -- the pre-procfs check above
+     * and gpio_request should already prevent concurrent registration,
+     * but this ensures correctness even if those guards somehow fail. */
     mutex_lock(&list_lock);
     list_for_each_entry(s, &sensor_list, list) {
         if (s->pin == pin) {
@@ -2181,11 +2206,11 @@ static void dht_load_config(void)
 
 /* Table of global proc entries created under /proc/sensors/dht/ */
 static const struct proc_entry_def global_proc_entries[] = {
-    { "debug",         0666, &debug_fops },
+    { "debug",         0644, &debug_fops },
     { "version",       0444, &version_fops },
-    { "export",        0222, &export_fops },
-    { "unexport",      0222, &unexport_fops },
-    { "auto_interval", 0666, &auto_interval_fops },
+    { "export",        0200, &export_fops },
+    { "unexport",      0200, &unexport_fops },
+    { "auto_interval", 0644, &auto_interval_fops },
 };
 
 /**
