@@ -1,0 +1,8 @@
+v2.0
+  [Fix 1] Log IRQ blocking latency notice (~4 ms per attempt, 5 retries max)
+          in dmesg at sensor registration
+  [Fix 2] dht_start_poll() returns int (0 / -ENOMEM) instead of void;
+          all 5 call sites check return code;
+          sensor_interval_write() propagates error to userspace;
+          replaced inline kthread_run in sensor_interval_write with
+          dht_start_poll() call for consistency
