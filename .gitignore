@@ -1,0 +1,13 @@
+*.cmd
+*.symvers
+*.o
+*.ko
+*.mod
+*.mod.*
+*.order
+*.old
+*.tmp
+*.bak
+*.sh
+examples/*
+!examples/*.c
