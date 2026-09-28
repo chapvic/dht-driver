@@ -823,22 +823,30 @@ static int dht_poll_thread_fn(void *data)
  *
  * Creates and starts a kernel thread named "dht_poll_<pin>" that will
  * periodically call dht_do_measurement(). If a thread is already running,
- * this function is a no-op.
+ * this function is a no-op (returns 0).
+ *
+ * Caller must hold list_lock to protect the poll_thread field.
+ *
+ * Returns: 0 on success (including no-op when thread already running),
+ *          -ENOMEM if kernel thread creation fails.
  */
-static void dht_start_poll(struct dht_sensor *sensor)
+static int dht_start_poll(struct dht_sensor *sensor)
 {
-    /* Caller must hold list_lock to protect poll_thread field */
     /* Don't start a duplicate thread if one is already running */
     if (sensor->poll_thread)
-        return;
+        return 0;
 
     /* Create and start the kernel thread */
     sensor->poll_thread = kthread_run(dht_poll_thread_fn, sensor,
                                       "dht_poll_%d", sensor->pin);
     if (IS_ERR(sensor->poll_thread)) {
-        pin_err(sensor->pin, "failed to create poll thread\n");
+        int err = PTR_ERR(sensor->poll_thread);
+        pin_err(sensor->pin, "failed to create poll thread (err=%d)\n", err);
         sensor->poll_thread = NULL;
+        return err;
     }
+
+    return 0;
 }
 
 /**
@@ -1240,8 +1248,11 @@ static ssize_t auto_interval_write(struct file *f, const char __user *buf, size_
     if (READ_ONCE(global_auto_interval) != -1) {
         struct dht_sensor *sensor;
         list_for_each_entry(sensor, &sensor_list, list) {
-            if (!sensor->poll_thread)
-                dht_start_poll(sensor);
+            if (!sensor->poll_thread) {
+                int err = dht_start_poll(sensor);
+                if (err)
+                    pin_err(sensor->pin, "auto_interval: failed to start poll thread (err=%d)\n", err);
+            }
         }
     }
 
@@ -1421,11 +1432,12 @@ static ssize_t sensor_interval_write(struct file *f, const char __user *buf, siz
         } else {
             /* Enable polling: start the thread if not already running */
             if (!sensor->poll_thread) {
-                sensor->poll_thread = kthread_run(dht_poll_thread_fn, sensor,
-                                                   "dht_poll_%d", sensor->pin);
-                if (IS_ERR(sensor->poll_thread)) {
-                    pin_err(sensor->pin, "failed to create poll thread\n");
-                    sensor->poll_thread = NULL;
+                int err = dht_start_poll(sensor);
+                if (err) {
+                    mutex_unlock(&list_lock);
+                    if (thread_to_stop)
+                        kthread_stop(thread_to_stop);
+                    return err;
                 }
             }
         }
@@ -1870,15 +1882,23 @@ static int dht_do_register(int pin, int interval)
 
     /* Start auto-polling: global mode takes priority, then per-sensor interval */
     if (READ_ONCE(global_auto_interval) != -1) {
-        dht_start_poll(sensor);
-        pin_log(pin, "auto-poll enabled by global setting\n");
+        int err = dht_start_poll(sensor);
+        if (err)
+            pin_err(pin, "failed to start poll thread (err=%d)\n", err);
+        else
+            pin_log(pin, "auto-poll enabled by global setting\n");
     } else if (interval != -1) {
-        dht_start_poll(sensor);
-        pin_log(pin, "auto-poll enabled (interval=%d)\n", interval);
+        int err = dht_start_poll(sensor);
+        if (err)
+            pin_err(pin, "failed to start poll thread (err=%d)\n", err);
+        else
+            pin_log(pin, "auto-poll enabled (interval=%d)\n", interval);
     }
     mutex_unlock(&list_lock);
 
     pin_log(pin, "registered successfully\n");
+    pin_log(pin, "note: each measurement blocks IRQ for up to ~4 ms (%d retries max)\n",
+            MAX_RETRIES);
     return 0;
 }
 
@@ -2085,8 +2105,11 @@ static int dht_config_set_auto_interval(int val)
     if (val != -1) {
         struct dht_sensor *sensor;
         list_for_each_entry(sensor, &sensor_list, list) {
-            if (!sensor->poll_thread)
-                dht_start_poll(sensor);
+            if (!sensor->poll_thread) {
+                int err = dht_start_poll(sensor);
+                if (err)
+                    pin_err(sensor->pin, "config: failed to start poll thread (err=%d)\n", err);
+            }
         }
     }
     mutex_unlock(&list_lock);
